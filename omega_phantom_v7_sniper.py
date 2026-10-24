@@ -7,11 +7,11 @@ SISTEMA: OMEGA-PHANTOM V7.0 (APEX-CHRONOS SINGULARITY)
 ==============================================================================
 Motor de Disparo Zero-REST con:
   1. Cotizacion Top-of-Book Exacta (prioridad FIFO #1 cuando spread == 1 tick).
-  2. Captura Hibrida de Ruptura Confirmada a 1.40s: si la orden PostOnly en el
-     pico no se llena porque el precio ya rompio 1 a 2 ticks a nuestro favor
-     con OFI fuerte (|OFI| >= 0.38) y H <= 0.480, ejecuta cruce controlado de
-     1 tick para no perder cascadas como las de 08:31, 08:51 y 09:15:06 CL.
-  3. Reserva de margen a 5x efectivo en produccion para desbloquear el Slot 2.
+  2. Recuperacion Instantanea ante Cancelacion Asincrona PostOnly de Bybit V5
+     (cuando el libro se mueve 1 tick durante los ~120ms de RTT y Bybit marca
+     status='canceled' a los 0.34s): re-cotiza en el nuevo Top-of-Book o
+     captura con Limit IOC si la ruptura a favor ya esta confirmada.
+  3. Captura Hibrida de Ruptura Confirmada a 1.20s y reserva de margen 5x.
 ==============================================================================
 """
 from __future__ import annotations
@@ -72,7 +72,7 @@ class EjecutorSniper:
             "XRP/USDT:USDT": {"tick_size": 0.0001, "step_size": 1.0, "min_qty": 1.0},
             "AVAX/USDT:USDT": {"tick_size": 0.001, "step_size": 0.1, "min_qty": 0.1},
             "TAO/USDT:USDT": {"tick_size": 0.01, "step_size": 0.001, "min_qty": 0.001},
-            "ARB/USDT:USDT": {"tick_size": 0.0001, "step_size": 0.1, "min_qty": 1.0},
+            "ARB/USDT:USDT": {"tick_size": 0.00001, "step_size": 0.1, "min_qty": 1.0},
             "BTC/USDT:USDT": {"tick_size": 0.1, "step_size": 0.001, "min_qty": 0.001},
         }
 
@@ -193,6 +193,50 @@ class EjecutorSniper:
         except Exception:
             pass
         return 0.0, precio_fallback
+
+    async def _ejecutar_cruce_ioc_controlado(
+        self,
+        symbol: str,
+        side: str,
+        side_orden: str,
+        qty: float,
+        precio_base: float,
+        tick_sym: float,
+    ) -> Tuple[float, float]:
+        if self.exchange is None or cfg.es_modo_test():
+            return 0.0, precio_base
+        tk_now = ESTADO_RAM.ticks_ram.get(symbol)
+        if tk_now is None or tk_now.bid <= 0.0 or tk_now.ask <= tk_now.bid:
+            return 0.0, precio_base
+
+        # Limita el deslizamiento maximo a 2 ticks respecto al precio_base original
+        if side == "short":
+            px_ioc = self.redondear_precio(symbol, max(tk_now.bid, precio_base - (2.0 * tick_sym)))
+        else:
+            px_ioc = self.redondear_precio(symbol, min(tk_now.ask, precio_base + (2.0 * tick_sym)))
+
+        try:
+            ord_ioc = await self.exchange.create_order(
+                symbol=symbol,
+                type="limit",
+                side=side_orden,
+                amount=qty,
+                price=px_ioc,
+                params={"timeInForce": "IOC", "reduceOnly": False},
+            )
+            oid_ioc = str(ord_ioc.get("id", "")) if isinstance(ord_ioc, dict) else ""
+            await asyncio.sleep(0.12)
+            q_p, px_p = await self._verificar_posicion_abierta_bybit(symbol, px_ioc)
+            if q_p > 0.0:
+                return q_p, px_p
+            if oid_ioc:
+                est_ioc = await self._consultar_orden_segura(oid_ioc, symbol)
+                f_ioc = float(est_ioc.get("filled", 0.0) or 0.0)
+                if f_ioc > 0.0:
+                    return f_ioc, float(est_ioc.get("average", 0.0) or px_ioc)
+        except Exception:
+            pass
+        return 0.0, precio_base
 
     async def _colocar_stop_loss_servidor_bybit(
         self,
@@ -360,16 +404,62 @@ class EjecutorSniper:
                     precio_llenado = avg_px if avg_px > 0.0 else precio_quote
                     break
 
+                tk_now = ESTADO_RAM.ticks_ram.get(symbol)
+                edad_cola = time.time() - t_inicio_cola
+
                 if status in ("canceled", "cancelled", "rejected", "expired"):
                     qty_llenada = filled
                     ya_cancelada_l1 = True
                     if filled > 0.0 and avg_px > 0.0:
                         precio_llenado = avg_px
+                        break
+
+                    # Si Bybit cancelo asincronamente el PostOnly (ej. a los 0.34s en ARB) porque el
+                    # libro se movio 1 tick durante el RTT, recuperamos la orden de inmediato:
+                    if (
+                        not cfg.es_modo_test()
+                        and repegs_realizados < 2
+                        and tk_now is not None
+                        and tk_now.bid > 0.0
+                        and tk_now.ask > tk_now.bid
+                        and tk_now.hurst <= 0.485
+                    ):
+                        repegs_realizados += 1
+                        sigue_fuerte = (
+                            (side == "short" and tk_now.ofi_l1_l5 <= -0.32)
+                            or (side == "long" and tk_now.ofi_l1_l5 >= 0.32)
+                        )
+                        if sigue_fuerte:
+                            nuevo_px = self.calcular_cotizacion_penny_jump(
+                                symbol=symbol,
+                                side=side,
+                                best_bid=tk_now.bid,
+                                best_ask=tk_now.ask,
+                                ofi=tk_now.ofi_l1_l5,
+                                sigma_bv=tk_now.volatilidad_local,
+                                hawkes_i=tk_now.hawkes_intensidad,
+                            )
+                            if abs(nuevo_px - precio_quote_inicial) <= (tick_sym * 3.0):
+                                nuevo_id, _ = await self._colocar_orden_limit_postonly(
+                                    symbol=symbol,
+                                    side_orden=side_orden,
+                                    qty=qty_l1,
+                                    precio=nuevo_px,
+                                )
+                                if nuevo_id:
+                                    order_id_l1 = nuevo_id
+                                    precio_quote = nuevo_px
+                                    ya_cancelada_l1 = False
+                                    continue
+                            q_ioc, px_ioc = await self._ejecutar_cruce_ioc_controlado(
+                                symbol, side, side_orden, qty_l1, precio_quote_inicial, tick_sym
+                            )
+                            if q_ioc > 0.0:
+                                qty_llenada = q_ioc
+                                precio_llenado = px_ioc
                     break
 
-                tk_now = ESTADO_RAM.ticks_ram.get(symbol)
                 if tk_now is not None:
-                    edad_cola = time.time() - t_inicio_cola
                     umbral_abort = (
                         abs(cfg.OFI_ABORTAR_COLA_UMBRAL)
                         if (cfg.es_modo_test() or edad_cola >= 0.90)
@@ -390,7 +480,6 @@ class EjecutorSniper:
                         ya_cancelada_l1 = True
                         break
 
-                    # Early Queue Abort si Hurst rompe a persistencia en plena cola
                     if not cfg.es_modo_test() and edad_cola >= 0.80 and tk_now.hurst > 0.498:
                         try:
                             await self.exchange.cancel_order(order_id_l1, symbol)
@@ -399,60 +488,42 @@ class EjecutorSniper:
                         ya_cancelada_l1 = True
                         break
 
-                    # Captura Hibrida de Ruptura Confirmada a 1.40s (max 1-2 ticks de desplazamiento a favor)
+                    # Captura Hibrida de Ruptura Confirmada a 1.20s
                     if (
                         not cfg.es_modo_test()
                         and repegs_realizados == 0
                         and filled <= 0.0
-                        and edad_cola >= 1.40
+                        and edad_cola >= 1.20
                         and tk_now.bid > 0.0
                         and tk_now.ask > tk_now.bid
-                        and tk_now.hurst <= 0.480
+                        and tk_now.hurst <= 0.482
                     ):
                         repegs_realizados += 1
                         rompio_short_a_favor = (
                             side == "short"
                             and (precio_quote_inicial - tk_now.bid) >= (tick_sym * 0.90)
-                            and (precio_quote_inicial - tk_now.bid) <= (tick_sym * 2.50)
-                            and tk_now.ofi_l1_l5 <= -0.38
+                            and (precio_quote_inicial - tk_now.bid) <= (tick_sym * 3.00)
+                            and tk_now.ofi_l1_l5 <= -0.34
                         )
                         rompio_long_a_favor = (
                             side == "long"
                             and (tk_now.ask - precio_quote_inicial) >= (tick_sym * 0.90)
-                            and (tk_now.ask - precio_quote_inicial) <= (tick_sym * 2.50)
-                            and tk_now.ofi_l1_l5 >= 0.38
+                            and (tk_now.ask - precio_quote_inicial) <= (tick_sym * 3.00)
+                            and tk_now.ofi_l1_l5 >= 0.34
                         )
                         if rompio_short_a_favor or rompio_long_a_favor:
                             try:
                                 await self.exchange.cancel_order(order_id_l1, symbol)
-                                ya_cancelada_l1 = True
-                                px_ioc = self.redondear_precio(
-                                    symbol, tk_now.bid if side == "short" else tk_now.ask
-                                )
-                                ord_ioc = await self.exchange.create_order(
-                                    symbol=symbol,
-                                    type="limit",
-                                    side=side_orden,
-                                    amount=qty_l1,
-                                    price=px_ioc,
-                                    params={"timeInForce": "IOC", "reduceOnly": False},
-                                )
-                                oid_ioc = str(ord_ioc.get("id", "")) if isinstance(ord_ioc, dict) else ""
-                                await asyncio.sleep(0.12)
-                                q_p, px_p = await self._verificar_posicion_abierta_bybit(symbol, px_ioc)
-                                if q_p > 0.0:
-                                    qty_llenada = q_p
-                                    precio_llenado = px_p
-                                    break
-                                if oid_ioc:
-                                    est_ioc = await self._consultar_orden_segura(oid_ioc, symbol)
-                                    f_ioc = float(est_ioc.get("filled", 0.0) or 0.0)
-                                    if f_ioc > 0.0:
-                                        qty_llenada = f_ioc
-                                        precio_llenado = float(est_ioc.get("average", 0.0) or px_ioc)
-                                        break
                             except Exception:
                                 pass
+                            ya_cancelada_l1 = True
+                            q_ioc, px_ioc = await self._ejecutar_cruce_ioc_controlado(
+                                symbol, side, side_orden, qty_l1, precio_quote_inicial, tick_sym
+                            )
+                            if q_ioc > 0.0:
+                                qty_llenada = q_ioc
+                                precio_llenado = px_ioc
+                            break
 
             if order_id_l2 and self.exchange is not None:
                 try:
@@ -481,8 +552,9 @@ class EjecutorSniper:
                     precio_llenado = px_pos
                 else:
                     TELEMETRIA_TG.descartar_apertura_no_llenada(symbol)
+                    edad_real = time.time() - t_inicio_cola
                     log_sniper(
-                        f"[COLA MOALLEMI-YUAN] Orden en {symbol} no llenada en {ttl_max:.1f}s (Cero Re-Quote): margen liberado."
+                        f"[COLA MOALLEMI-YUAN] Orden en {symbol} no llenada en {edad_real:.1f}s (Cero Re-Quote): margen liberado."
                     )
                     return None
 
