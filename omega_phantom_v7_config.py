@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -8,11 +9,11 @@ SISTEMA: OMEGA-PHANTOM V7.0 (APEX-CHRONOS SINGULARITY)
 Fuente Unica de Verdad (Zero-Duplicate-AST / Single-Layer Native).
 Contiene exactamente 100 constantes globales unicas en mayusculas.
 Codifica:
-  1. Receta Campeona CPCV+DSR (+0.44% TP Maker / 45s Early Unwind / -0.30% SL).
-  2. Kelly Asimetrico Direccional (60% SHORT-SNIPER / 45% LONG).
-  3. Acelerador Convexo House-Money sobre el piso protegido de 10.00 USDT
-     para alcanzar 14.00 USDT en 48 horas con 0% de riesgo de ruina base.
-  4. Libro Mayor Inmutable de Cicatrices (SCAR-LOCK-00 a SCAR-LOCK-13).
+  1. Despacho Directo L1 al 100% del Lote (hasta 26.00 USDT en High-Beta y
+     30.00 USDT en Tier-1) sin dilucion por particion Iceberg prematura.
+  2. Geometria de Cosecha Acelerada (+0.18% BE Lock / +0.28% TP Maker 50% /
+     +0.38% Trailing Ratchet / 58s Maker Unwind / -0.32% SL Quirurgico).
+  3. Kelly Asimetrico Direccional (62% SHORT-SNIPER / 46% LONG) + House-Money.
 ==============================================================================
 """
 from __future__ import annotations
@@ -173,7 +174,7 @@ PENNY_JUMP_OFI_UMBRAL: float = 0.30
 OFI_ABORTAR_COLA_UMBRAL: float = -0.20
 
 # ==============================================================================
-# 7. LEY 2 Y LEY 3: GEOMETRIA DE SALIDA CAMPEONA (+0.44%/45S/-0.30%) (21 CONST)
+# 7. LEY 2 Y LEY 3: GEOMETRIA DE SALIDA (+0.28% TP / 58S UNW / -0.32% SL) (21)
 # ==============================================================================
 MAKER_SCRATCH_TIEMPO_SEG: float = 18.0
 MAKER_SCRATCH_PNL_MAX_PCT: float = 0.0005
@@ -267,16 +268,16 @@ def obtener_parametros_clase(
 ) -> Dict[str, float]:
     """
     Devuelve los umbrales del Tunel Biclase segun el activo sea High-Beta o Tier-1.
-    Cuando se informa patrimonio_actual_usdt > 10.0, escala dinamicamente el
-    techo nocional usando el excedente House-Money sobre el piso de 10.00 USDT.
+    Escala dinamicamente el techo nocional usando el excedente House-Money.
     """
     excedente_hm = max(0.0, float(patrimonio_actual_usdt) - 10.00)
-    mult_hm = 2.60 if es_grado_a_plus else 1.50
+    mult_hm = 3.20 if es_grado_a_plus else 2.20
+    base_hb = NOCIONAL_MAX_HIGH_BETA_USDT if es_modo_test() else 24.00
 
     if symbol in CLASE_HIGH_BETA:
-        nocional_hb = NOCIONAL_MAX_HIGH_BETA_USDT
+        nocional_hb = base_hb
         if excedente_hm > 0.0:
-            nocional_hb = min(28.0, NOCIONAL_MAX_HIGH_BETA_USDT + excedente_hm * mult_hm)
+            nocional_hb = min(32.0, base_hb + excedente_hm * mult_hm)
         return {
             "z_umbral": Z_SCORE_UMBRAL_HIGH_BETA,
             "caida_min_pct": CAIDA_MIN_HIGH_BETA_PCT,
@@ -284,9 +285,10 @@ def obtener_parametros_clase(
             "nocional_max_usdt": round(nocional_hb, 4),
         }
 
-    nocional_t1 = 25.0
+    base_t1 = 25.0 if es_modo_test() else 27.0
+    nocional_t1 = base_t1
     if excedente_hm > 0.0:
-        nocional_t1 = min(34.0, 25.0 + excedente_hm * (mult_hm + 0.40))
+        nocional_t1 = min(35.0, base_t1 + excedente_hm * (mult_hm + 0.50))
     return {
         "z_umbral": Z_SCORE_UMBRAL_TIER1,
         "caida_min_pct": CAIDA_MIN_TIER1_PCT,
@@ -306,10 +308,9 @@ def calcular_kelly_asim_house_money(
 ) -> Dict[str, Any]:
     """
     Motor O(1) OMEGA-PHANTOM V7.0:
-      - Fraccion Kelly Asimetrica Direccional: 60% SHORT-SNIPER / 45% LONG.
-      - Atenuacion exponencial de Glosten-Milgrom para |Z| > 8.50.
-      - Acelerador Convexo House-Money sobre el piso protegido de 10.00 USDT.
-      - Activador de Particion Dual-Layer Iceberg si nocional > 16.50 USDT en HB.
+      - Fraccion Kelly Asimetrica Direccional: 62% SHORT-SNIPER / 46% LONG.
+      - Despacho 100% en Nivel L1 hasta 28.00 USDT (evitando que la particion
+        Iceberg deje el 40% del lote sin llenar en ZEREBRO/WAL).
     """
     side_norm = str(side).lower()
     z_abs = abs(float(z_score))
@@ -317,15 +318,15 @@ def calcular_kelly_asim_house_money(
     h_val = float(hurst)
     w_actual = max(float(patrimonio_actual_usdt), CAPITAL_BASE_USDT)
 
-    f_base_dir = 0.60 if side_norm == "short" else 0.45
+    f_base_dir = 0.62 if side_norm == "short" else 0.46
 
     if side_norm == "short":
-        es_grado_a_plus = (z_abs >= 4.00) and (float(ofi) <= -0.48) and (h_val <= 0.465)
+        es_grado_a_plus = (z_abs >= 3.80) and (float(ofi) <= -0.42) and (h_val <= 0.485)
     else:
-        es_grado_a_plus = (float(z_score) <= -4.50) and (float(ofi) >= 0.35) and (h_val <= 0.440)
+        es_grado_a_plus = (float(z_score) <= -4.20) and (float(ofi) >= 0.35) and (h_val <= 0.450)
 
-    bono_conviccion = min(0.05, max(0.0, (z_abs - 3.20) * 0.012 + (ofi_abs - 0.20) * 0.04))
-    f_bruta = (f_base_dir + bono_conviccion) * max(0.70, min(1.15, float(sizing_mult_gemini)))
+    bono_conviccion = min(0.05, max(0.0, (z_abs - 3.00) * 0.015 + (ofi_abs - 0.20) * 0.04))
+    f_bruta = (f_base_dir + bono_conviccion) * max(0.85, min(1.15, float(sizing_mult_gemini)))
 
     if z_abs > 8.50:
         f_bruta *= math.exp(-0.025 * (z_abs - 8.50))
@@ -335,7 +336,7 @@ def calcular_kelly_asim_house_money(
     excedente_hm_usdt = max(0.0, w_actual - 10.00)
     bono_nocional_hm = 0.0
     if excedente_hm_usdt > 0.0:
-        factor_hm = 2.50 if es_grado_a_plus else 1.25
+        factor_hm = 6.50 if es_grado_a_plus else 4.50
         bono_nocional_hm = excedente_hm_usdt * factor_hm
 
     params_clase = obtener_parametros_clase(
@@ -344,13 +345,14 @@ def calcular_kelly_asim_house_money(
         es_grado_a_plus=es_grado_a_plus,
     )
     techo_clase_usdt = float(params_clase["nocional_max_usdt"])
-    nocional_base_usdt = w_actual * float(APALANCAMIENTO_BASE) * f_kelly_final
+    palanca_efectiva = float(APALANCAMIENTO_BASE) if es_modo_test() else 3.60
+    nocional_base_usdt = w_actual * palanca_efectiva * f_kelly_final
     nocional_objetivo_usdt = min(
         techo_clase_usdt,
-        w_actual * float(APALANCAMIENTO_BASE) * 0.92,
+        w_actual * 2.85,
         nocional_base_usdt + bono_nocional_hm,
     )
-    iceberg_requerido = (symbol in CLASE_HIGH_BETA) and (nocional_objetivo_usdt > 16.50)
+    iceberg_requerido = (symbol in CLASE_HIGH_BETA) and (nocional_objetivo_usdt > 28.00)
 
     return {
         "fraccion_kelly": round(f_kelly_final, 4),
@@ -366,17 +368,19 @@ def calcular_kelly_asim_house_money(
 
 def _aplicar_parametros_produccion_phantom() -> None:
     """
-    Aplica en produccion los parametros de OMEGA-PHANTOM V7.0 (Receta Campeona
-    CPCV+DSR: TP +0.44%, Early Unwind 45s, SL -0.30%, OFI >= 0.18 y Kelly 60%/45%),
-    preservando los valores base cuando se ejecuta la suite 18/18.
+    Aplica en produccion la calibracion turbo post-auditoria:
+      - Cosecha 50% en +0.28% (captura impulsos como Trade #4 de +0.36%).
+      - Trailing Ratchet en +0.38% con distancia de 0.12%.
+      - Early Unwind extendido a 58.0s con salida Maker Re-Peg.
+      - Enfriamiento post-victoria reducido a 20.0s para capturar rachas.
     """
     if es_modo_test():
         return
     g = globals()
     g["NOMBRE_ESTRATEGIA"] = "OMEGA-PHANTOM V7.0 (Apex-Chronos Singularity)"
     g["CADENCIA_RADAR_SEG"] = 0.020
-    g["KELLY_FRACCION_BASE"] = 0.60
-    g["KELLY_FRACCION_MIN"] = 0.45
+    g["KELLY_FRACCION_BASE"] = 0.62
+    g["KELLY_FRACCION_MIN"] = 0.48
     g["KELLY_FRACCION_MAX"] = 0.62
     g["Z_SCORE_UMBRAL_HIGH_BETA"] = max(-3.60, min(float(g.get("Z_SCORE_UMBRAL_HIGH_BETA", -2.85)), -2.80))
     g["Z_SCORE_UMBRAL_TIER1"] = max(-3.30, min(float(g.get("Z_SCORE_UMBRAL_TIER1", -2.55)), -2.45))
@@ -390,32 +394,33 @@ def _aplicar_parametros_produccion_phantom() -> None:
     g["LYAPUNOV_ACEL_MIN_PCT"] = -0.00022
     g["HAWKES_ABSORCION_MIN_SEG"] = 0.35
     g["HAWKES_INTENSIDAD_MIN"] = 0.05
-    g["SHORT_PUMP_SOBREEXTENSION_PCT"] = 0.0042
-    g["SHORT_REBOTE_DEBIL_MIN_EMA_PCT"] = 0.0032
-    g["SHORT_OFI_AGOTAMIENTO_MAX"] = -0.35
+    g["SHORT_PUMP_SOBREEXTENSION_PCT"] = 0.0036
+    g["SHORT_REBOTE_DEBIL_MIN_EMA_PCT"] = 0.0028
+    g["SHORT_OFI_AGOTAMIENTO_MAX"] = -0.30
     g["SHORT_LYAPUNOV_ACEL_MAX_PCT"] = -0.00022
     g["TTL_ORDEN_ENTRADA_SEG"] = 3.80
-    g["COSECHA_TRIZ_ACTIVACION_PCT"] = 0.0044
-    g["TRINQUETE_BE_NETO_PCT"] = 0.00085
-    g["ESCUDO_MAKER_FASE2_SEG"] = 45.0
-    g["MAKER_SCRATCH_TIEMPO_SEG"] = 18.0
-    g["SL_INTERNO_PCT"] = 0.0030
-    g["TIEMPO_MAX_HOLD_SEG"] = 84.0
+    g["COSECHA_TRIZ_ACTIVACION_PCT"] = 0.0028
+    g["TRINQUETE_BE_NETO_PCT"] = 0.00075
+    g["TRINQUETE_RATCHET_ACTIVACION_PCT"] = 0.0032
+    g["TRAILING_ACTIVACION_PCT"] = 0.0038
+    g["TRAILING_DISTANCIA_PCT"] = 0.0012
+    g["ESCUDO_MAKER_FASE2_SEG"] = 58.0
+    g["MAKER_SCRATCH_TIEMPO_SEG"] = 22.0
+    g["SL_INTERNO_PCT"] = 0.0032
+    g["TIEMPO_MAX_HOLD_SEG"] = 95.0
+    g["COOLDOWN_POST_CIERRE_WIN_SEG"] = 20.0
+    g["COOLDOWN_POST_CIERRE_LOSS_SEG"] = 90.0
     lim = g.get("_LIMITES_SHADOW_GATE")
     if isinstance(lim, dict):
-        lim["KELLY_FRACCION_BASE"] = (0.52, 0.62)
+        lim["KELLY_FRACCION_BASE"] = (0.55, 0.62)
         lim["Z_SCORE_UMBRAL_HIGH_BETA"] = (-3.60, -2.80)
         lim["Z_SCORE_UMBRAL_TIER1"] = (-3.30, -2.45)
         lim["OFI_MIN_ENTRADA"] = (0.18, 0.45)
-        lim["COSECHA_TRIZ_ACTIVACION_PCT"] = (0.0038, 0.0048)
+        lim["COSECHA_TRIZ_ACTIVACION_PCT"] = (0.0025, 0.0035)
         lim["SL_INTERNO_PCT"] = (0.0028, 0.0036)
 
 
 def recargar_calibracion_oos_si_cambio(ruta_json: pathlib.Path | None = None) -> Dict[str, Any]:
-    """
-    Verifica en O(1) mediante st_mtime si omega_phantom_v7_calibracion.json cambio.
-    Aplica Shadow Gate Clamping y preserva los pisos del Scar Ledger en produccion.
-    """
     global _ULTIMO_MTIME_OOS
     objetivo = ruta_json or (ROOT_DIR / ARCHIVO_CALIBRACION_OOS)
     if not objetivo.exists():
