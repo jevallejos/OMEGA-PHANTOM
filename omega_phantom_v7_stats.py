@@ -8,7 +8,8 @@ SISTEMA: OMEGA-PHANTOM V7.0 (APEX-CHRONOS SINGULARITY)
 Motor Contable de Caja Negra (omega_phantom_v7_stats.jsonl):
   1. Desduplicacion automatica O(N) en el arranque.
   2. Contabilidad real de cosechas parciales verificadas en Bybit.
-  3. Paridad Exacta 1:1 con el patrimonio real de Bybit UTA (SCAR-LOCK-04).
+  3. Paridad Exacta 1:1 con el patrimonio real de Bybit UTA (SCAR-LOCK-04),
+     persistida en el archivo de lock para sincronizar la consola CLI veromega.
   4. Calculo de MAP, LVR, Velocidad Geometrica g* (Kelly-Shannon) y progreso
      hacia la meta del Desafio 48H (10.00 USDT -> 14.00 USDT).
   5. Escritura automatica de TRADE_COMPLETO en omega_phantom_v7_baul_ia.jsonl.
@@ -45,63 +46,94 @@ class GestorCajaNegra:
         self.patrimonio_real_uta_usdt: float = cfg.CAPITAL_BASE_USDT
         self.cargar_y_auditar_historial()
 
+    def _leer_paridad_uta_desde_lock(self) -> None:
+        if cfg.es_modo_test():
+            return
+        ruta_lock = cfg.ROOT_DIR / cfg.ARCHIVO_LOCK_PRODUCCION
+        if not ruta_lock.exists():
+            return
+        try:
+            lineas = ruta_lock.read_text(encoding="utf-8").splitlines()
+            if len(lineas) >= 2:
+                val_uta = float(lineas[1].strip())
+                if val_uta > 0.0:
+                    self.patrimonio_real_uta_usdt = val_uta
+                    pnl_trades = sum(op.pnl_usdt for op in self.operaciones)
+                    balance_crudo = cfg.CAPITAL_BASE_USDT + pnl_trades + self.pnl_cosechas_huérfanas_usdt
+                    self.ajuste_paridad_uta_usdt = round(self.patrimonio_real_uta_usdt - balance_crudo, 6)
+        except Exception:
+            pass
+
+    def _guardar_paridad_uta_en_lock(self, balance_uta: float) -> None:
+        if cfg.es_modo_test() or balance_uta <= 0.0:
+            return
+        ruta_lock = cfg.ROOT_DIR / cfg.ARCHIVO_LOCK_PRODUCCION
+        if not ruta_lock.exists():
+            return
+        try:
+            lineas = ruta_lock.read_text(encoding="utf-8").splitlines()
+            pid_str = lineas[0].strip() if lineas else ""
+            if pid_str:
+                ruta_lock.write_text(f"{pid_str}\n{balance_uta:.6f}\n", encoding="utf-8")
+        except Exception:
+            pass
+
     def cargar_y_auditar_historial(self) -> int:
         self.operaciones.clear()
-        if not self.ruta_jsonl.exists():
-            return 0
+        if self.ruta_jsonl.exists():
+            vistos: set[str] = set()
+            lineas_limpias: List[str] = []
+            duplicados = 0
 
-        vistos: set[str] = set()
-        lineas_limpias: List[str] = []
-        duplicados = 0
+            try:
+                for linea in self.ruta_jsonl.read_text(encoding="utf-8-sig").splitlines():
+                    linea_str = linea.strip()
+                    if not linea_str:
+                        continue
+                    try:
+                        d = json.loads(linea_str)
+                    except Exception:
+                        continue
 
-        try:
-            for linea in self.ruta_jsonl.read_text(encoding="utf-8-sig").splitlines():
-                linea_str = linea.strip()
-                if not linea_str:
-                    continue
-                try:
-                    d = json.loads(linea_str)
-                except Exception:
-                    continue
+                    clave = (
+                        f"{d.get('timestamp', '')}|{d.get('symbol', '')}|"
+                        f"{d.get('side', '')}|{round(float(d.get('entry_price', 0.0)), 6)}|"
+                        f"{round(float(d.get('exit_price', 0.0)), 6)}"
+                    )
+                    if clave in vistos:
+                        duplicados += 1
+                        continue
+                    vistos.add(clave)
+                    lineas_limpias.append(json.dumps(d, ensure_ascii=False))
 
-                clave = (
-                    f"{d.get('timestamp', '')}|{d.get('symbol', '')}|"
-                    f"{d.get('side', '')}|{round(float(d.get('entry_price', 0.0)), 6)}|"
-                    f"{round(float(d.get('exit_price', 0.0)), 6)}"
-                )
-                if clave in vistos:
-                    duplicados += 1
-                    continue
-                vistos.add(clave)
-                lineas_limpias.append(json.dumps(d, ensure_ascii=False))
+                    reg = RegistroOperacionCerrada(
+                        timestamp=str(d.get("timestamp", "")),
+                        symbol=str(d.get("symbol", "")),
+                        side=str(d.get("side", "long")),
+                        z_score_entry=float(d["z_score_entry"]) if d.get("z_score_entry") is not None else 0.0,
+                        ofi_entry=float(d["ofi_entry"]) if d.get("ofi_entry") is not None else 0.0,
+                        hurst_entry=float(d["hurst_entry"]) if d.get("hurst_entry") is not None else 0.45,
+                        pnl_percentage=float(d.get("pnl_percentage", 0.0)),
+                        pnl_usdt=float(d.get("pnl_usdt", 0.0)),
+                        entry_price=float(d.get("entry_price", 0.0)),
+                        exit_price=float(d.get("exit_price", 0.0)),
+                        qty=float(d.get("qty", 0.0)),
+                        motivo=str(d.get("motivo", "UNKNOWN")),
+                        hold_seg=float(d.get("hold_seg", 0.0)),
+                        fees_usdt=float(d.get("fees_usdt", 0.0)),
+                        map_usdt=float(d.get("map_usdt", 0.0)),
+                        lvr_usdt=float(d.get("lvr_usdt", 0.0)),
+                        cosecha_triz_50=bool(d.get("cosecha_triz_50", False)),
+                    )
+                    self.operaciones.append(reg)
 
-                reg = RegistroOperacionCerrada(
-                    timestamp=str(d.get("timestamp", "")),
-                    symbol=str(d.get("symbol", "")),
-                    side=str(d.get("side", "long")),
-                    z_score_entry=float(d["z_score_entry"]) if d.get("z_score_entry") is not None else 0.0,
-                    ofi_entry=float(d["ofi_entry"]) if d.get("ofi_entry") is not None else 0.0,
-                    hurst_entry=float(d["hurst_entry"]) if d.get("hurst_entry") is not None else 0.45,
-                    pnl_percentage=float(d.get("pnl_percentage", 0.0)),
-                    pnl_usdt=float(d.get("pnl_usdt", 0.0)),
-                    entry_price=float(d.get("entry_price", 0.0)),
-                    exit_price=float(d.get("exit_price", 0.0)),
-                    qty=float(d.get("qty", 0.0)),
-                    motivo=str(d.get("motivo", "UNKNOWN")),
-                    hold_seg=float(d.get("hold_seg", 0.0)),
-                    fees_usdt=float(d.get("fees_usdt", 0.0)),
-                    map_usdt=float(d.get("map_usdt", 0.0)),
-                    lvr_usdt=float(d.get("lvr_usdt", 0.0)),
-                    cosecha_triz_50=bool(d.get("cosecha_triz_50", False)),
-                )
-                self.operaciones.append(reg)
-
-            if duplicados > 0 and not cfg.es_modo_test():
-                self.ruta_jsonl.write_text("\n".join(lineas_limpias) + "\n", encoding="utf-8")
-        except Exception as exc:
-            log_sniper(f"[CAJA NEGRA WARN] Error auditando historial: {exc}")
+                if duplicados > 0 and not cfg.es_modo_test():
+                    self.ruta_jsonl.write_text("\n".join(lineas_limpias) + "\n", encoding="utf-8")
+            except Exception as exc:
+                log_sniper(f"[CAJA NEGRA WARN] Error auditando historial: {exc}")
 
         self.cosechas_parciales_count = sum(1 for op in self.operaciones if op.cosecha_triz_50)
+        self._leer_paridad_uta_desde_lock()
         return len(self.operaciones)
 
     def registrar_cosecha_parcial_en_vivo(self, pos: PosicionActiva, pnl_parcial_neto_usdt: float, fee_usdt: float) -> None:
@@ -121,6 +153,7 @@ class GestorCajaNegra:
         balance_crudo = cfg.CAPITAL_BASE_USDT + pnl_trades + self.pnl_cosechas_huérfanas_usdt
         self.ajuste_paridad_uta_usdt = round(self.patrimonio_real_uta_usdt - balance_crudo, 6)
         ESTADO_RAM.sincronizar_balance_uta(self.patrimonio_real_uta_usdt, self.patrimonio_real_uta_usdt)
+        self._guardar_paridad_uta_en_lock(self.patrimonio_real_uta_usdt)
         return self.obtener_balance_contable_usdt()
 
     def obtener_pnl_neto_total_usdt(self) -> float:
@@ -227,7 +260,9 @@ class GestorCajaNegra:
             )
 
         nuevo_bal = self.obtener_balance_contable_usdt()
+        self.patrimonio_real_uta_usdt = nuevo_bal
         ESTADO_RAM.sincronizar_balance_uta(nuevo_bal, nuevo_bal)
+        self._guardar_paridad_uta_en_lock(nuevo_bal)
         self.imprimir_hud_caja_negra()
         return registro
 
@@ -256,7 +291,6 @@ class GestorCajaNegra:
             sl_teorico = op.map_usdt * (cfg.SL_INTERNO_PCT + cfg.FEE_TAKER_PCT)
             ahorro_scratch += max(0.0, sl_teorico - abs(op.pnl_usdt))
 
-        # Velocidad geometrica g* de Kelly-Shannon
         g_star = 0.0
         if n_total > 0 and map_medio > 0.0:
             rets = [max(-0.95, op.pnl_usdt / max(1.0, cfg.CAPITAL_BASE_USDT)) for op in self.operaciones]

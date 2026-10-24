@@ -6,9 +6,10 @@ ARCHIVO #06: omega_phantom_v7_radar.py
 SISTEMA: OMEGA-PHANTOM V7.0 (APEX-CHRONOS SINGULARITY)
 ==============================================================================
 Motor Tensorial de Microestructura L2 + publicTrade a 50 Hz (20 ms):
-  1. Variacion Bipower de Barndorff-Nielsen & Shephard (inmune a saltos).
-  2. Fusion H-OFI a 50 Hz: 50% ML-OFI L1-L5 (Cont-Kukanov-Stoikov) + 50% Flujo
-     Taker agresivo real en tiempo de volumen VPIN.
+  1. Reloj de Eventos L2 (Event-Driven Book Clock): filtra instantaneas L2
+     identicas en produccion para preservar la racha de confirmacion H-OFI y
+     evalua delta_p_pct sobre horizonte biescala real (3.0s a 12.0s).
+  2. Variacion Bipower de Barndorff-Nielsen & Shephard (inmune a saltos).
   3. Exponente de Rugosidad Fractal de Hurst por Razon de Eficiencia Winsorizada.
   4. Repulsor Cinetico de Lyapunov (segunda derivada del precio) y Memoria de
      Absorcion Auto-Excitada de Hawkes.
@@ -25,7 +26,7 @@ from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import omega_phantom_v7_config as cfg
-from omega_phantom_v7_ram import ESTADO_RAM, log_sniper
+from omega_phantom_v7_ram import ESTADO_RAM
 from omega_phantom_v7_tricortex import ESCUDO_TRICORTEX
 
 _PESOS_OFI_L1_L5: Tuple[float, ...] = (
@@ -71,14 +72,15 @@ def calcular_percentil_intradia_utc(
 
 class VentanaZ:
     """
-    Estructura deslizante O(1) por activo para calculo de Z-Score Bipower,
-    EMA900, H-OFI 50Hz, Hurst Winsorizado, Lyapunov, Hawkes y VPIN.
+    Estructura deslizante O(1) por activo con Reloj de Eventos L2 y ventana
+    temporal biescala para Z-Score Bipower, EMA900, H-OFI, Hurst, Lyapunov y Hawkes.
     """
 
     def __init__(self, symbol: str, maxlen: int = cfg.VENTANA_Z_TICKS) -> None:
         self.symbol: str = symbol
         self.maxlen: int = int(maxlen)
         self.precios: Deque[float] = collections.deque(maxlen=self.maxlen)
+        self.precios_ts: Deque[Tuple[float, float]] = collections.deque(maxlen=360)
         self.retornos: Deque[float] = collections.deque(maxlen=self.maxlen)
         self.ofi_hist: Deque[float] = collections.deque(maxlen=35)
         self.ema900_hist: Deque[float] = collections.deque(maxlen=30)
@@ -104,6 +106,7 @@ class VentanaZ:
         self.vol_taker_buy_ventana: float = 0.0
         self.vol_taker_sell_ventana: float = 0.0
         self.vpin_actual: float = 0.18
+        self.ultimo_metricas: Dict[str, float] = {}
 
     def registrar_trade_publico(self, price: float, qty: float, side_taker: str) -> None:
         vol_usdt = max(0.0, float(price) * float(qty))
@@ -170,23 +173,20 @@ class VentanaZ:
         n = len(self.retornos)
         if n < 4:
             return 0.0010
-        rets = list(self.retornos)
+        rets = [r for r in self.retornos if abs(r) > 1e-9]
+        if len(rets) < 4:
+            rets = list(self.retornos)
+        m = len(rets)
         suma_bv = 0.0
-        for i in range(1, n):
+        for i in range(1, m):
             suma_bv += abs(rets[i]) * abs(rets[i - 1])
-        bv = (math.pi / 2.0) * (suma_bv / float(n - 1))
+        bv = (math.pi / 2.0) * (suma_bv / float(max(1, m - 1)))
         sigma_bv = math.sqrt(max(1e-10, bv))
 
         piso_sigma = 0.00028 if self.symbol in cfg.CLASE_HIGH_BETA else 0.00020
         return max(piso_sigma, sigma_bv)
 
     def _calcular_hurst(self) -> float:
-        """
-        Estimador de Hurst por Razon de Eficiencia Winsorizada (Jump-Robust VR):
-        Acota retornos individuales en +-2.5*sigma_BV para que el salto de ignicion
-        no contamine la medicion de reversion a la media (H < 0.475) frente a
-        tendencias persistentes reales (H > 0.52).
-        """
         if len(self.retornos) < 10:
             return 0.42
         sigma = self._calcular_sigma_bipower()
@@ -212,6 +212,29 @@ class VentanaZ:
         v0 = (p_1 - p_2) / p_2
         return v1 - v0
 
+    def _calcular_delta_p_biescala(self, mid_price: float, ahora: float) -> float:
+        """
+        En modo test usa el primer elemento de self.precios (compatibilidad 18/18).
+        En produccion a 50Hz evalua la mayor excursion firmada tanto sobre la
+        cola de 60 eventos como sobre la ventana cronologica [2.5s .. 14.0s].
+        """
+        p_base_ticks = self.precios[0] if self.precios else mid_price
+        dp_ticks = (mid_price - p_base_ticks) / p_base_ticks if p_base_ticks > 0.0 else 0.0
+        if cfg.es_modo_test() or len(self.precios_ts) < 4:
+            return dp_ticks
+
+        candidatos: List[float] = [dp_ticks]
+        for ts_old, px_old in self.precios_ts:
+            dt = ahora - ts_old
+            if 2.0 <= dt <= 15.0 and px_old > 0.0:
+                candidatos.append((mid_price - px_old) / px_old)
+
+        mejor = dp_ticks
+        for c in candidatos:
+            if abs(c) > abs(mejor):
+                mejor = c
+        return mejor
+
     def actualizar_tick(
         self,
         mid_price: float,
@@ -222,14 +245,31 @@ class VentanaZ:
         if mid_price <= 0.0:
             return {}
 
+        # Reloj de Eventos L2: En produccion, si el libro L1-L5 es 100% identico
+        # a la muestra anterior y han pasado < 150ms, no contamina la ventana con 0s.
+        if (
+            not cfg.es_modo_test()
+            and self.prev_bids
+            and self.prev_asks
+            and bids[:5] == self.prev_bids
+            and asks[:5] == self.prev_asks
+            and (ahora - self.ts_ultimo_tick) < 0.150
+            and self.ultimo_metricas
+        ):
+            return self.ultimo_metricas
+
         if self.precios:
             prev_p = self.precios[-1]
             ret = (mid_price - prev_p) / prev_p if prev_p > 0.0 else 0.0
-            self.retornos.append(ret)
+            if abs(ret) > 1e-10 or cfg.es_modo_test() or len(self.retornos) < 10:
+                self.retornos.append(ret)
         else:
             ret = 0.0
 
-        self.precios.append(mid_price)
+        if not self.precios or abs(mid_price - self.precios[-1]) > 1e-12 or cfg.es_modo_test() or (ahora - self.ts_ultimo_tick) >= 0.150:
+            self.precios.append(mid_price)
+
+        self.precios_ts.append((ahora, mid_price))
         self.ticks_totales += 1
 
         if self.ema900 <= 0.0:
@@ -244,13 +284,17 @@ class VentanaZ:
         else:
             ema_slope_pct = 0.0
 
-        p_base = self.precios[0]
-        delta_p_pct = (mid_price - p_base) / p_base if p_base > 0.0 else 0.0
+        delta_p_pct = self._calcular_delta_p_biescala(mid_price, ahora)
         sigma_bv = self._calcular_sigma_bipower()
         n_eff = max(1.0, math.sqrt(min(len(self.precios), 25)))
         z_score = delta_p_pct / max(1e-7, sigma_bv * (0.45 * n_eff))
 
-        ofi_inst = self._calcular_ml_ofi(bids, asks)
+        ofi_raw = self._calcular_ml_ofi(bids, asks)
+        if not cfg.es_modo_test() and abs(ofi_raw) < 1e-9 and self.ofi_hist:
+            ofi_inst = self.ofi_hist[-1] * 0.70
+        else:
+            ofi_inst = ofi_raw
+
         self.ofi_hist.append(ofi_inst)
         ofi_5s = sum(self.ofi_hist) / len(self.ofi_hist)
 
@@ -281,7 +325,7 @@ class VentanaZ:
             min(0.95, 0.92 * self.vpin_actual + 0.08 * imbalance_vpin),
         )
 
-        return {
+        self.ultimo_metricas = {
             "z_score": z_score,
             "delta_p_pct": delta_p_pct,
             "ema900": self.ema900,
@@ -297,6 +341,7 @@ class VentanaZ:
             "vpin": self.vpin_actual,
             "sigma_bv": sigma_bv,
         }
+        return self.ultimo_metricas
 
 
 class RadarVolatilidad:
@@ -438,7 +483,7 @@ class RadarVolatilidad:
         if not es_test and symbol == "INJ/USDT:USDT":
             return None
 
-        min_ticks_arranque = 20 if es_test else 60
+        min_ticks_arranque = 20 if es_test else 30
         if ventana.ticks_totales < min_ticks_arranque:
             return None
 

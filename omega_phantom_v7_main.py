@@ -9,8 +9,8 @@ Kernel Orquestador Asincrono sobre uvloop (Linux) / asyncio (Windows):
   1. Cerrojo Fisico de Instancia Unica (.omega_phantom_v7.lock) con verificacion
      de PID vivo en el kernel.
   2. Reconciliacion Inteligente de Arranque en Bybit UTA: adopta posiciones
-     abiertas, cancela ordenes huerfanas y sincroniza Paridad Exacta 1:1
-     (SCAR-LOCK-04).
+     abiertas sin warnings de array en V5, cancela ordenes huerfanas y
+     sincroniza Paridad Exacta 1:1 (SCAR-LOCK-04).
   3. Auditoria de Lotes Minimos Indivisibles por simbolo.
   4. Bucle de Ingesta Hibrida a 50 Hz (20 ms) L2 + publicTrade, Vigilancia
      Multi-Slot de Posiciones, Enjambre Tri-Cortex LPU y Hot-Reload OOS.
@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 
 import omega_phantom_v7_config as cfg
 from omega_phantom_v7_gestor import GESTOR_POSICIONES
-from omega_phantom_v7_radar import RADAR
+from omega_phantom_v7_radar import RADAR, calcular_percentil_intradia_utc
 from omega_phantom_v7_ram import ESTADO_RAM, PosicionActiva, log_sniper
 from omega_phantom_v7_sniper import EJECUTOR_SNIPER
 from omega_phantom_v7_stats import CAJA_NEGRA
@@ -67,8 +67,9 @@ class CerrojoInstanciaUnica:
     def adquirir(self) -> bool:
         if self.ruta_lock.exists():
             try:
-                contenido = self.ruta_lock.read_text(encoding="utf-8").strip()
-                pid_antiguo = int(contenido) if contenido else -1
+                lineas = self.ruta_lock.read_text(encoding="utf-8").splitlines()
+                primera = lineas[0].strip() if lineas else ""
+                pid_antiguo = int(primera) if primera else -1
                 if self._pid_esta_vivo(pid_antiguo) and pid_antiguo != os.getpid():
                     log_sniper(
                         f"[LOCK ERROR] Instancia activa detectada con PID {pid_antiguo} en {self.ruta_lock.name}."
@@ -90,8 +91,9 @@ class CerrojoInstanciaUnica:
             return
         try:
             if self.ruta_lock.exists():
-                contenido = self.ruta_lock.read_text(encoding="utf-8").strip()
-                if contenido == str(os.getpid()):
+                lineas = self.ruta_lock.read_text(encoding="utf-8").splitlines()
+                primera = lineas[0].strip() if lineas else ""
+                if primera == str(os.getpid()):
                     self.ruta_lock.unlink(missing_ok=True)
         except Exception:
             pass
@@ -131,13 +133,19 @@ async def reconciliar_posiciones_arranque(exchange: Any) -> Dict[str, Any]:
 
     simbolos_con_posicion: set[str] = set()
     try:
-        posiciones = await exchange.fetch_positions(list(cfg.PARES_CAMPEONES_ALFA))
+        try:
+            posiciones = await exchange.fetch_positions(
+                None, {"category": "linear", "settleCoin": "USDT"}
+            )
+        except TypeError:
+            posiciones = await exchange.fetch_positions(list(cfg.PARES_CAMPEONES_ALFA))
+
         for p in posiciones or []:
             contracts = float(p.get("contracts", 0.0) or p.get("info", {}).get("size", 0.0) or 0.0)
             if contracts <= 0.0:
                 continue
             sym = str(p.get("symbol", ""))
-            if not sym:
+            if not sym or sym not in cfg.PARES_CAMPEONES_ALFA:
                 continue
             side = str(p.get("side", "long")).lower()
             entry_px = float(p.get("entryPrice", 0.0) or p.get("info", {}).get("avgPrice", 0.0) or 0.0)
@@ -265,7 +273,9 @@ class MotorOmegaPhantomV7:
         return ex
 
     async def _ingerir_simbolo_50hz(self, symbol: str) -> None:
-        if self.exchange is None:
+        if self.exchange is None or symbol in ESTADO_RAM.pares_excluidos_lote:
+            return
+        if symbol == "INJ/USDT:USDT" and not cfg.es_modo_test():
             return
         try:
             ob = await self.exchange.fetch_order_book(symbol, limit=10)
@@ -283,7 +293,7 @@ class MotorOmegaPhantomV7:
             if senal is not None:
                 log_sniper(
                     f"[RADAR 50HZ] {symbol} [{senal['side'].upper()} | {senal['grado_senal']} | {senal['slot_modo']}] "
-                    f"Z={senal['z_score']:+.2f} | EMA900={senal['ema900_dist_pct']*100:+.2f}% | "
+                    f"Z={senal['z_score']:+.2f} | dp={senal['delta_p_pct']*100:+.2f}% | EMA900={senal['ema900_dist_pct']*100:+.2f}% | "
                     f"OFI={senal['ofi']:+.2f} | H={senal['hurst']:.3f} -> DISPARO APROBADO"
                 )
                 await EJECUTOR_SNIPER.ejecutar_senal_sniper(senal)
@@ -327,6 +337,20 @@ class MotorOmegaPhantomV7:
                         CAJA_NEGRA.sincronizar_paridad_uta(tot)
 
                 ciclo += 1
+                if ciclo % 2 == 0:
+                    tk_z = ESTADO_RAM.ticks_ram.get("ZEREBRO/USDT:USDT")
+                    tk_w = ESTADO_RAM.ticks_ram.get("WAL/USDT:USDT")
+                    tk_a = ESTADO_RAM.ticks_ram.get("ARB/USDT:USDT")
+                    p_dia, tag_p, _ = calcular_percentil_intradia_utc(
+                        sigma_bv=tk_z.volatilidad_local if tk_z else 0.0006
+                    )
+                    if tk_z and tk_w and tk_a:
+                        log_sniper(
+                            f"[PULSO 50HZ {tag_p} ({p_dia:.2f})] "
+                            f"ZEREBRO(Z={tk_z.z_score:+.2f}, dp={tk_z.delta_p_pct*100:+.2f}%, EMA={tk_z.ema900_dist_pct*100:+.2f}%, OFI={tk_z.ofi_l1_l5:+.2f}, H={tk_z.hurst:.2f}) | "
+                            f"WAL(Z={tk_w.z_score:+.2f}, OFI={tk_w.ofi_l1_l5:+.2f}) | "
+                            f"ARB(Z={tk_a.z_score:+.2f}, OFI={tk_a.ofi_l1_l5:+.2f})"
+                        )
                 if ciclo % 10 == 0:
                     CAJA_NEGRA.imprimir_hud_caja_negra()
             except asyncio.CancelledError:
