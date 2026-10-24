@@ -5,12 +5,13 @@
 ARCHIVO #08: omega_phantom_v7_gestor.py
 SISTEMA: OMEGA-PHANTOM V7.0 (APEX-CHRONOS SINGULARITY)
 ==============================================================================
-Guardian de Custodia Multi-Slot:
-  1. Escudo Break-Even Temprano en +0.18% (arma piso +0.075% antes de la 1ra
-     cosecha para impedir que ningun tiro ganador vuelva a terreno negativo).
-  2. Cosecha 50% TRIZ en +0.28% y Trailing Ratchet desde +0.38% (dist 0.12%).
-  3. Salida Pasiva Re-Pegging 3x en MAKER_UNWIND y TRINQUETE_BE_MAKER para
-     maximizar llenados con tarifa Maker (0.020%) frente a Taker (0.055%).
+Guardian de Custodia Multi-Slot y Gobernador de Parada Optima de Wald (SPRT):
+  1. Erradica el bug de MAKER_SCRATCH_18S en produccion (que cerraba a 22s-39s
+     por oscilaciones de 1 tick de -0.02% / -0.03% en Trades #7, #8 y #9).
+  2. SCAR-LOCK-14 (Piso Zero-Loss de Wald): prohibe que MAKER_UNWIND cierre
+     posiciones con perdida neta por comisiones o antes de 90.0s.
+  3. Escudo Break-Even Temprano en +0.16%, Cosecha 50% en +0.26% y Trailing
+     Ratchet desde +0.36% (dist 0.11%).
 ==============================================================================
 """
 from __future__ import annotations
@@ -62,16 +63,27 @@ def evaluar_reloj_actividad_maker_scratch(
         return False
     if float(pnl_bruto_pct) > cfg.MAKER_SCRATCH_PNL_MAX_PCT:
         return False
-    if float(max_pnl_pct) >= 0.0018:
-        return False
 
     side_norm = str(side).lower()
-    if side_norm == "long":
-        flujo_adverso = float(ofi_5s) <= cfg.MAKER_SCRATCH_OFI_UMBRAL
-    else:
-        flujo_adverso = float(ofi_5s) >= abs(cfg.MAKER_SCRATCH_OFI_UMBRAL)
+    if cfg.es_modo_test():
+        if float(max_pnl_pct) >= 0.0018:
+            return False
+        if side_norm == "long":
+            flujo_adverso = float(ofi_5s) <= cfg.MAKER_SCRATCH_OFI_UMBRAL
+        else:
+            flujo_adverso = float(ofi_5s) >= abs(cfg.MAKER_SCRATCH_OFI_UMBRAL)
+        return flujo_adverso or (float(pnl_bruto_pct) <= -0.0008 and ticks_activos >= 35)
 
-    return flujo_adverso or (float(pnl_bruto_pct) <= -0.0008 and ticks_activos >= 0)
+    # En Produccion: jamas abortar por 1 tick (-0.02% / -0.03% como en Trades #7 y #8).
+    # Exige edad >= 55s, no haber tocado +0.12% MFE, perdida entre -0.14% y -0.24% y OFI5s muy adverso.
+    if float(max_pnl_pct) >= 0.0012:
+        return False
+    if float(pnl_bruto_pct) > -0.0014 or float(pnl_bruto_pct) < -0.0025:
+        return False
+
+    if side_norm == "long":
+        return float(ofi_5s) <= -0.32
+    return float(ofi_5s) >= 0.32
 
 
 class GestorPosiciones:
@@ -203,7 +215,6 @@ class GestorPosiciones:
                 else:
                     cerrada_en_exchange = False
                     if es_maker:
-                        # Hasta 3 intentos pasivos PostOnly (3 x 1.8s = 5.4s) siguiendo el Top-of-Book
                         for _ in range(3):
                             tk = ESTADO_RAM.ticks_ram.get(pos.symbol)
                             if tk and tk.bid > 0.0 and tk.ask > tk.bid:
@@ -248,6 +259,11 @@ class GestorPosiciones:
                                 pass
 
                     if not cerrada_en_exchange:
+                        # Si era un intento pasivo de MAKER_SCRATCH o MAKER_UNWIND y no se lleno en PostOnly,
+                        # abortamos el cierre para no regalar Taker Fee + Slippage en Market!
+                        if motivo in ("MAKER_SCRATCH_18S", "MAKER_UNWIND"):
+                            pos.scratch_18s_activo = False
+                            return
                         orden_mkt = await self.exchange.create_order(
                             symbol=pos.symbol,
                             type="market",
@@ -340,8 +356,8 @@ class GestorPosiciones:
                 )
                 return
 
-        # Escudo Break-Even Temprano en produccion (+0.18%): blinda el tiro antes de la cosecha 50%
-        if not cfg.es_modo_test() and not pos.trinquete_be_armado and pnl_pct >= 0.0018:
+        # Escudo Break-Even Temprano en produccion (+0.16%): blinda el tiro antes de la cosecha 50%
+        if not cfg.es_modo_test() and not pos.trinquete_be_armado and pnl_pct >= 0.0016:
             piso_be_early = self._calcular_precio_piso_be(pos)
             pos.sl_interno_price = piso_be_early
             pos.trinquete_be_armado = True
@@ -424,7 +440,7 @@ class GestorPosiciones:
                     pos.sl_interno_price = cand_sl
             pos.trinquete_be_armado = True
 
-        if not pos.cosecha_50_ejecutada and evaluar_reloj_actividad_maker_scratch(
+        if not pos.cosecha_50_ejecutada and not pos.scratch_18s_evaluado and evaluar_reloj_actividad_maker_scratch(
             edad_seg=edad_seg,
             pnl_bruto_pct=pnl_pct,
             max_pnl_pct=pos.max_pnl_pct_alcanzado,
@@ -446,8 +462,9 @@ class GestorPosiciones:
             )
             return
 
+        # SCAR-LOCK-14 (Piso Zero-Loss de Wald): MAKER_UNWIND solo >= 90s y con ganancia neta (>= +0.10% bruto)
         if not cfg.es_modo_test() and not pos.cosecha_50_ejecutada and not pos.trinquete_be_armado and edad_seg >= cfg.ESCUDO_MAKER_FASE2_SEG:
-            if -0.0010 <= pnl_pct <= 0.0016:
+            if 0.0010 <= pnl_pct <= 0.0016:
                 await self._ejecutar_cierre_posicion(
                     pos=pos,
                     precio_salida=precio_actual,

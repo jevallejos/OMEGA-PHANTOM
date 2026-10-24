@@ -6,11 +6,12 @@ ARCHIVO #06: omega_phantom_v7_radar.py
 SISTEMA: OMEGA-PHANTOM V7.0 (APEX-CHRONOS SINGULARITY)
 ==============================================================================
 Motor Tensorial de Microestructura L2 + publicTrade a 50 Hz (20 ms):
-  1. Techo Fractal Estricto en SHORT-SNIPER (H <= 0.492 en High-Beta / 0.485 en
-     Tier-1): bloquea el 100% del SL #6 (H=0.503) preservando los Wins (#2..#5).
-  2. SCAR-LOCK-11 Dinamico: protege durante 75s tras un SL en Short y permite
-     capturar el climax de agotamiento superior (+0.50% detectado en Baul IA).
-  3. Supresor de rafaga de 4.2s (permite re-disparar tras expiracion TTL=3.8s).
+  1. SCAR-LOCK-15 (Anti-Chasing Post-Cola): enfriamiento de 28.0s tras cada
+     disparo por simbolo y prohibicion de re-disparar a un precio peor tras
+     una orden expirada (erradica las entradas perseguidas de Trades #7 y #8).
+  2. Calibracion Biescala por Clase: exige climax real en ZEREBRO (Z>=3.35,
+     dp>=0.24%, EMA900>=0.32%, erradicando el Trade #9) y umbrales especificos
+     en WAL y Tier-1 (ARB/AVAX/XRP con H<=0.468 y dp>=0.14%).
 ==============================================================================
 """
 from __future__ import annotations
@@ -89,6 +90,8 @@ class VentanaZ:
         self.ts_ultimo_anti_squeeze: float = 0.0
         self.px_ultimo_anti_squeeze: float = 0.0
         self.ts_ultimo_disparo: float = 0.0
+        self.px_ultimo_disparo_short: float = 0.0
+        self.px_ultimo_disparo_long: float = 0.0
 
         self.max_z_short_reciente: float = 0.0
         self.max_dp_short_reciente: float = 0.0
@@ -283,7 +286,7 @@ class VentanaZ:
         n_eff = max(1.0, math.sqrt(min(len(self.precios), 25)))
         z_score = delta_p_pct / max(1e-7, sigma_bv * (0.45 * n_eff))
 
-        if (ahora - self.ts_pico_short_reciente) > 8.0:
+        if (ahora - self.ts_pico_short_reciente) > 6.0:
             self.max_z_short_reciente = z_score
             self.max_dp_short_reciente = delta_p_pct
             self.max_ema_short_reciente = ema_dist_pct
@@ -312,7 +315,7 @@ class VentanaZ:
         else:
             self.ofi_ticks_long = 0
 
-        umbral_ofi_s = cfg.SHORT_OFI_AGOTAMIENTO_MAX if cfg.es_modo_test() else -0.30
+        umbral_ofi_s = cfg.SHORT_OFI_AGOTAMIENTO_MAX if cfg.es_modo_test() else -0.32
         if ofi_inst <= umbral_ofi_s:
             self.ofi_ticks_short += 1
         else:
@@ -356,7 +359,7 @@ class VentanaZ:
 class RadarVolatilidad:
     """
     Motor de deteccion microestructural de alta frecuencia (50 Hz) con
-    ejecucion secuencial de los 14 cerrojos SCAR-LOCK-00 a SCAR-LOCK-13.
+    ejecucion secuencial de los cerrojos SCAR-LOCK-00 a SCAR-LOCK-15.
     """
 
     def __init__(self) -> None:
@@ -492,7 +495,8 @@ class RadarVolatilidad:
         if not es_test and symbol == "INJ/USDT:USDT":
             return None
 
-        if not es_test and (t_now - ventana.ts_ultimo_disparo) < 4.20:
+        # SCAR-LOCK-15: Prohibido re-disparar 4s despues de una orden expirada persiguiendo el precio
+        if not es_test and (t_now - ventana.ts_ultimo_disparo) < 28.0:
             return None
 
         min_ticks_arranque = 20 if es_test else 30
@@ -524,14 +528,18 @@ class RadarVolatilidad:
             caida_min_long = float(params_clase["caida_min_pct"])
             ema_min_long = float(params_clase["ema900_dist_min_pct"])
         else:
-            if symbol in cfg.CLASE_HIGH_BETA:
+            if symbol == "ZEREBRO/USDT:USDT":
                 z_umbral_long = -3.60
                 caida_min_long = -0.0044
                 ema_min_long = -0.0040
+            elif symbol == "WAL/USDT:USDT":
+                z_umbral_long = -3.10
+                caida_min_long = -0.0022
+                ema_min_long = -0.0022
             else:
-                z_umbral_long = float(params_clase["z_umbral"])
-                caida_min_long = -0.0025
-                ema_min_long = -0.0025
+                z_umbral_long = -2.80
+                caida_min_long = -0.0016
+                ema_min_long = -0.0018
 
         if (
             tk.z_score <= z_umbral_long
@@ -593,6 +601,7 @@ class RadarVolatilidad:
                 return None
 
             ventana.ts_ultimo_disparo = t_now
+            ventana.px_ultimo_disparo_long = mid_price
             kelly_info = ESCUDO_TRICORTEX.calcular_fraccion_kelly_antifragil(
                 symbol=symbol,
                 z_score=tk.z_score,
@@ -636,17 +645,26 @@ class RadarVolatilidad:
             return senal_long
 
         # ======================================================================
-        # RUTA 2: EVALUACION DE GATILLO SHORT-SNIPER (SCAR-LOCK-01, 08, 11)
+        # RUTA 2: EVALUACION DE GATILLO SHORT-SNIPER (SCAR-LOCK-01, 08, 11, 15)
         # ======================================================================
         if not cfg.MODO_BIDIRECCIONAL:
             return None
 
-        z_umbral_short = abs(float(params_clase["z_umbral"]))
-        z_eval_short = (
-            tk.z_score
-            if es_test
-            else max(tk.z_score, ventana.max_z_short_reciente if (t_now - ventana.ts_pico_short_reciente) <= 8.0 else tk.z_score)
-        )
+        if es_test:
+            z_umbral_short = abs(float(params_clase["z_umbral"]))
+            z_eval_short = tk.z_score
+        else:
+            if symbol == "ZEREBRO/USDT:USDT":
+                z_umbral_short = 3.35
+            elif symbol == "WAL/USDT:USDT":
+                z_umbral_short = 3.00
+            else:
+                z_umbral_short = 2.95
+            z_eval_short = max(
+                tk.z_score,
+                ventana.max_z_short_reciente if (t_now - ventana.ts_pico_short_reciente) <= 5.0 else tk.z_score,
+            )
+
         if z_eval_short < z_umbral_short:
             return None
 
@@ -666,32 +684,54 @@ class RadarVolatilidad:
             ):
                 return None
         else:
-            piso_ema_short = 0.0026 if symbol in cfg.CLASE_HIGH_BETA else 0.0018
-            bono_h_short = 0.0008 if tk.hurst >= 0.480 else 0.0
-            ema_req_short = piso_ema_short + 0.0006 * p_dia + bono_h_short
+            if symbol == "ZEREBRO/USDT:USDT":
+                piso_ema_short = 0.0032
+                dp_min_s = 0.0024
+            elif symbol == "WAL/USDT:USDT":
+                piso_ema_short = 0.0022
+                dp_min_s = 0.0016
+            else:
+                piso_ema_short = 0.0022
+                dp_min_s = 0.0014
 
-            ema_eval_s = max(tk.ema900_dist_pct, ventana.max_ema_short_reciente if (t_now - ventana.ts_pico_short_reciente) <= 8.0 else tk.ema900_dist_pct)
-            dp_eval_s = max(tk.delta_p_pct, ventana.max_dp_short_reciente if (t_now - ventana.ts_pico_short_reciente) <= 8.0 else tk.delta_p_pct)
-            dp_min_s = 0.0014 if symbol in cfg.CLASE_HIGH_BETA else 0.0012
+            bono_h_short = 0.0006 if tk.hurst >= 0.475 else 0.0
+            ema_req_short = piso_ema_short + 0.0004 * p_dia + bono_h_short
 
-            if tk.ema900_dist_pct < 0.0016 or ema_eval_s < ema_req_short or dp_eval_s < dp_min_s:
+            ema_eval_s = max(
+                tk.ema900_dist_pct,
+                ventana.max_ema_short_reciente if (t_now - ventana.ts_pico_short_reciente) <= 5.0 else tk.ema900_dist_pct,
+            )
+            dp_eval_s = max(
+                tk.delta_p_pct,
+                ventana.max_dp_short_reciente if (t_now - ventana.ts_pico_short_reciente) <= 5.0 else tk.delta_p_pct,
+            )
+
+            if tk.ema900_dist_pct < (piso_ema_short * 0.85) or ema_eval_s < ema_req_short or dp_eval_s < dp_min_s:
                 return None
 
-            # SCAR-LOCK-11 Dinamico: Bloqueo duro 75s post-SL; luego permite climax de agotamiento superior
+            # SCAR-LOCK-15: Si hace menos de 90s se disparo un SHORT en este par, exigir un techo superior (+0.08%)
+            if (
+                ventana.px_ultimo_disparo_short > 0.0
+                and (t_now - ventana.ts_ultimo_disparo) < 90.0
+                and mid_price < ventana.px_ultimo_disparo_short * 1.0008
+            ):
+                return None
+
+            # SCAR-LOCK-11 Dinamico: Bloqueo duro 90s post-SL; luego permite climax de agotamiento superior
             sl_prev = ESTADO_RAM.ultimo_sl_short_precio.get(symbol)
             if sl_prev is not None:
                 px_sl_prev, ts_sl_prev = sl_prev
                 dt_sl = t_now - ts_sl_prev
-                if dt_sl < 75.0:
+                if dt_sl < 90.0:
                     ESTADO_RAM.encolar_auditoria_escudo_15s(
-                        symbol, "short", "SCAR-LOCK-11_STEP_LOCK", mid_price, tag_p, p_dia, "Step-Lock 75s", t_now
+                        symbol, "short", "SCAR-LOCK-11_STEP_LOCK", mid_price, tag_p, p_dia, "Step-Lock 90s", t_now
                     )
                     return None
                 if dt_sl < 600.0 and mid_price >= px_sl_prev * 0.9985:
                     es_climax_agotamiento = (
                         tk.ema900_dist_pct >= 0.0044
                         and tk.ofi_l1_l5 <= -0.45
-                        and tk.hurst <= 0.485
+                        and tk.hurst <= 0.480
                     )
                     if not es_climax_agotamiento:
                         ESTADO_RAM.encolar_auditoria_escudo_15s(
@@ -699,16 +739,16 @@ class RadarVolatilidad:
                         )
                         return None
 
-            # Techo Fractal Estricto en SHORT (erradica el SL #6 con H=0.503)
-            h_max_short = 0.485 if symbol in cfg.CLASE_TIER1_LIQUIDO else 0.492
+            # Techo Fractal Estricto en SHORT (erradica el SL #6 con H=0.503 y el Trade #8)
+            h_max_short = 0.468 if symbol in cfg.CLASE_TIER1_LIQUIDO else 0.488
             if tk.hurst > h_max_short:
                 return None
 
-            ofi_max_short = -(0.28 + 0.08 * p_dia)
+            ofi_max_short = -(0.32 + 0.06 * p_dia)
             if (
                 tk.ofi_l1_l5 > ofi_max_short
                 or tk.ofi_ticks_confirmados_short < cfg.OFI_TICKS_CONFIRMACION
-                or tk.lyapunov_acel_pct > 0.00015
+                or tk.lyapunov_acel_pct > 0.00010
             ):
                 return None
 
@@ -722,6 +762,7 @@ class RadarVolatilidad:
             return None
 
         ventana.ts_ultimo_disparo = t_now
+        ventana.px_ultimo_disparo_short = mid_price
         kelly_info_s = ESCUDO_TRICORTEX.calcular_fraccion_kelly_antifragil(
             symbol=symbol,
             z_score=z_eval_short,

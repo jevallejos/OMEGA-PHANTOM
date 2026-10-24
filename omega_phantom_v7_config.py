@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -9,11 +8,11 @@ SISTEMA: OMEGA-PHANTOM V7.0 (APEX-CHRONOS SINGULARITY)
 Fuente Unica de Verdad (Zero-Duplicate-AST / Single-Layer Native).
 Contiene exactamente 100 constantes globales unicas en mayusculas.
 Codifica:
-  1. Despacho Directo L1 al 100% del Lote (hasta 26.00 USDT en High-Beta y
-     30.00 USDT en Tier-1) sin dilucion por particion Iceberg prematura.
-  2. Geometria de Cosecha Acelerada (+0.18% BE Lock / +0.28% TP Maker 50% /
-     +0.38% Trailing Ratchet / 58s Maker Unwind / -0.32% SL Quirurgico).
-  3. Kelly Asimetrico Direccional (62% SHORT-SNIPER / 46% LONG) + House-Money.
+  1. Despacho Directo L1 al 100% del Lote (hasta 27.00 USDT en High-Beta y
+     30.00 USDT en Tier-1) con reserva de margen 5x para habilitar 2 Slots.
+  2. Geometria de Cosecha Acelerada (+0.16% BE Lock / +0.26% TP Maker 50% /
+     +0.36% Trailing Ratchet / 90s Zero-Loss Unwind / -0.34% SL Quirurgico).
+  3. Kelly Asimetrico Direccional (62% SHORT-SNIPER / 48% LONG) + House-Money.
 ==============================================================================
 """
 from __future__ import annotations
@@ -174,7 +173,7 @@ PENNY_JUMP_OFI_UMBRAL: float = 0.30
 OFI_ABORTAR_COLA_UMBRAL: float = -0.20
 
 # ==============================================================================
-# 7. LEY 2 Y LEY 3: GEOMETRIA DE SALIDA (+0.28% TP / 58S UNW / -0.32% SL) (21)
+# 7. LEY 2 Y LEY 3: GEOMETRIA DE SALIDA (+0.26% TP / 90S UNW / -0.34% SL) (21)
 # ==============================================================================
 MAKER_SCRATCH_TIEMPO_SEG: float = 18.0
 MAKER_SCRATCH_PNL_MAX_PCT: float = 0.0005
@@ -184,7 +183,7 @@ MAKER_SCRATCH_MAX_LOSS_PCT: float = -0.0014
 COSECHA_TRIZ_ACTIVACION_PCT: float = 0.0026
 COSECHA_TRIZ_FRACCION: float = 0.50
 TRINQUETE_BE_NETO_PCT: float = 0.0012
-TRINQUETE_RATCHET_ACTIVACION_PCT: float = 0.0038
+TRINQUETE_RATCHET_ACTIVACION_PCT: float = 0.0036
 TRINQUETE_DISTANCIA_TICKS: int = 2
 TRAILING_ACTIVACION_PCT: float = 0.0065
 TRAILING_DISTANCIA_PCT: float = 0.0022
@@ -197,7 +196,7 @@ PERSISTENCIA_ORDEN_MAKER_SEG: float = 12.0
 SL_INTERNO_PCT: float = 0.0048
 SL_BYBIT_SERVIDOR_PCT: float = 0.0070
 TIEMPO_MAX_HOLD_SEG: float = 90.0
-TIEMPO_MAX_HOLD_TRINQUETE_SEG: float = 180.0
+TIEMPO_MAX_HOLD_TRINQUETE_SEG: float = 210.0
 COOLDOWN_POST_CIERRE_WIN_SEG: float = 90.0
 COOLDOWN_POST_CIERRE_LOSS_SEG: float = 300.0
 
@@ -242,14 +241,14 @@ NVIDIA_MODEL_POOL: Tuple[str, ...] = (
 _ULTIMO_MTIME_OOS: float = 0.0
 
 _LIMITES_SHADOW_GATE: Dict[str, Tuple[float, float]] = {
-    "KELLY_FRACCION_BASE": (0.35, 0.62),
-    "Z_SCORE_UMBRAL_HIGH_BETA": (-4.50, -2.80),
-    "Z_SCORE_UMBRAL_TIER1": (-4.00, -2.45),
+    "KELLY_FRACCION_BASE": (0.35, 0.65),
+    "Z_SCORE_UMBRAL_HIGH_BETA": (-4.50, -2.75),
+    "Z_SCORE_UMBRAL_TIER1": (-4.00, -2.40),
     "OFI_MIN_ENTRADA": (0.08, 0.45),
-    "MAKER_SCRATCH_TIEMPO_SEG": (12.0, 25.0),
+    "MAKER_SCRATCH_TIEMPO_SEG": (12.0, 65.0),
     "COSECHA_TRIZ_ACTIVACION_PCT": (0.0022, 0.0048),
     "SL_INTERNO_PCT": (0.0028, 0.0060),
-    "TIEMPO_MAX_HOLD_SEG": (60.0, 120.0),
+    "TIEMPO_MAX_HOLD_SEG": (60.0, 180.0),
 }
 
 
@@ -271,13 +270,13 @@ def obtener_parametros_clase(
     Escala dinamicamente el techo nocional usando el excedente House-Money.
     """
     excedente_hm = max(0.0, float(patrimonio_actual_usdt) - 10.00)
-    mult_hm = 3.20 if es_grado_a_plus else 2.20
-    base_hb = NOCIONAL_MAX_HIGH_BETA_USDT if es_modo_test() else 24.00
+    mult_hm = 3.50 if es_grado_a_plus else 2.50
+    base_hb = NOCIONAL_MAX_HIGH_BETA_USDT if es_modo_test() else 26.00
 
     if symbol in CLASE_HIGH_BETA:
         nocional_hb = base_hb
         if excedente_hm > 0.0:
-            nocional_hb = min(32.0, base_hb + excedente_hm * mult_hm)
+            nocional_hb = min(34.0, base_hb + excedente_hm * mult_hm)
         return {
             "z_umbral": Z_SCORE_UMBRAL_HIGH_BETA,
             "caida_min_pct": CAIDA_MIN_HIGH_BETA_PCT,
@@ -285,10 +284,10 @@ def obtener_parametros_clase(
             "nocional_max_usdt": round(nocional_hb, 4),
         }
 
-    base_t1 = 25.0 if es_modo_test() else 27.0
+    base_t1 = 25.0 if es_modo_test() else 28.0
     nocional_t1 = base_t1
     if excedente_hm > 0.0:
-        nocional_t1 = min(35.0, base_t1 + excedente_hm * (mult_hm + 0.50))
+        nocional_t1 = min(36.0, base_t1 + excedente_hm * (mult_hm + 0.50))
     return {
         "z_umbral": Z_SCORE_UMBRAL_TIER1,
         "caida_min_pct": CAIDA_MIN_TIER1_PCT,
@@ -308,9 +307,8 @@ def calcular_kelly_asim_house_money(
 ) -> Dict[str, Any]:
     """
     Motor O(1) OMEGA-PHANTOM V7.0:
-      - Fraccion Kelly Asimetrica Direccional: 62% SHORT-SNIPER / 46% LONG.
-      - Despacho 100% en Nivel L1 hasta 28.00 USDT (evitando que la particion
-        Iceberg deje el 40% del lote sin llenar en ZEREBRO/WAL).
+      - Fraccion Kelly Asimetrica Direccional: 62% SHORT-SNIPER / 48% LONG.
+      - Despacho 100% en Nivel L1 hasta 30.00 USDT sin dilucion Iceberg.
     """
     side_norm = str(side).lower()
     z_abs = abs(float(z_score))
@@ -318,7 +316,7 @@ def calcular_kelly_asim_house_money(
     h_val = float(hurst)
     w_actual = max(float(patrimonio_actual_usdt), CAPITAL_BASE_USDT)
 
-    f_base_dir = 0.62 if side_norm == "short" else 0.46
+    f_base_dir = 0.62 if side_norm == "short" else 0.48
 
     if side_norm == "short":
         es_grado_a_plus = (z_abs >= 3.80) and (float(ofi) <= -0.42) and (h_val <= 0.485)
@@ -345,14 +343,14 @@ def calcular_kelly_asim_house_money(
         es_grado_a_plus=es_grado_a_plus,
     )
     techo_clase_usdt = float(params_clase["nocional_max_usdt"])
-    palanca_efectiva = float(APALANCAMIENTO_BASE) if es_modo_test() else 3.60
+    palanca_efectiva = float(APALANCAMIENTO_BASE) if es_modo_test() else 4.00
     nocional_base_usdt = w_actual * palanca_efectiva * f_kelly_final
     nocional_objetivo_usdt = min(
         techo_clase_usdt,
         w_actual * 2.85,
         nocional_base_usdt + bono_nocional_hm,
     )
-    iceberg_requerido = (symbol in CLASE_HIGH_BETA) and (nocional_objetivo_usdt > 28.00)
+    iceberg_requerido = (symbol in CLASE_HIGH_BETA) and (nocional_objetivo_usdt > 30.00)
 
     return {
         "fraccion_kelly": round(f_kelly_final, 4),
@@ -368,11 +366,13 @@ def calcular_kelly_asim_house_money(
 
 def _aplicar_parametros_produccion_phantom() -> None:
     """
-    Aplica en produccion la calibracion turbo post-auditoria:
-      - Cosecha 50% en +0.28% (captura impulsos como Trade #4 de +0.36%).
-      - Trailing Ratchet en +0.38% con distancia de 0.12%.
-      - Early Unwind extendido a 58.0s con salida Maker Re-Peg.
-      - Enfriamiento post-victoria reducido a 20.0s para capturar rachas.
+    Aplica en produccion la calibracion V7.2 post-auditoria de Trades #7..#9:
+      - Erradica el disparo prematuro de MAKER_SCRATCH_18S por 1 tick (-0.02%):
+        extiende MAKER_SCRATCH_TIEMPO_SEG a 55.0s y exige perdida real.
+      - Escudo Break-Even Temprano en +0.16%, Cosecha 50% en +0.26% y Trailing
+        Ratchet desde +0.36% (dist 0.11%).
+      - SCAR-LOCK-14 (Wald Zero-Loss): MAKER_UNWIND solo tras 90.0s y con PnL
+        neto positivo (>= +0.10% bruto).
     """
     if es_modo_test():
         return
@@ -382,42 +382,35 @@ def _aplicar_parametros_produccion_phantom() -> None:
     g["KELLY_FRACCION_BASE"] = 0.62
     g["KELLY_FRACCION_MIN"] = 0.48
     g["KELLY_FRACCION_MAX"] = 0.62
-    g["Z_SCORE_UMBRAL_HIGH_BETA"] = max(-3.60, min(float(g.get("Z_SCORE_UMBRAL_HIGH_BETA", -2.85)), -2.80))
-    g["Z_SCORE_UMBRAL_TIER1"] = max(-3.30, min(float(g.get("Z_SCORE_UMBRAL_TIER1", -2.55)), -2.45))
-    g["CAIDA_MIN_HIGH_BETA_PCT"] = -0.0028
-    g["CAIDA_MIN_TIER1_PCT"] = -0.0020
-    g["EMA900_DIST_MIN_HIGH_BETA_PCT"] = -0.0028
-    g["EMA900_DIST_MIN_TIER1_PCT"] = -0.0020
+    g["Z_SCORE_UMBRAL_HIGH_BETA"] = -3.10
+    g["Z_SCORE_UMBRAL_TIER1"] = -2.65
+    g["CAIDA_MIN_HIGH_BETA_PCT"] = -0.0032
+    g["CAIDA_MIN_TIER1_PCT"] = -0.0018
+    g["EMA900_DIST_MIN_HIGH_BETA_PCT"] = -0.0032
+    g["EMA900_DIST_MIN_TIER1_PCT"] = -0.0018
     g["OFI_MIN_ENTRADA"] = 0.18
     g["OFI_TICKS_CONFIRMACION"] = 2
-    g["HURST_MAX_ENTRADA"] = 0.475
+    g["HURST_MAX_ENTRADA"] = 0.472
     g["LYAPUNOV_ACEL_MIN_PCT"] = -0.00022
     g["HAWKES_ABSORCION_MIN_SEG"] = 0.35
     g["HAWKES_INTENSIDAD_MIN"] = 0.05
     g["SHORT_PUMP_SOBREEXTENSION_PCT"] = 0.0036
     g["SHORT_REBOTE_DEBIL_MIN_EMA_PCT"] = 0.0028
-    g["SHORT_OFI_AGOTAMIENTO_MAX"] = -0.30
+    g["SHORT_OFI_AGOTAMIENTO_MAX"] = -0.32
     g["SHORT_LYAPUNOV_ACEL_MAX_PCT"] = -0.00022
-    g["TTL_ORDEN_ENTRADA_SEG"] = 3.80
-    g["COSECHA_TRIZ_ACTIVACION_PCT"] = 0.0028
+    g["TTL_ORDEN_ENTRADA_SEG"] = 3.20
+    g["OFI_ABORTAR_COLA_UMBRAL"] = -0.35
+    g["COSECHA_TRIZ_ACTIVACION_PCT"] = 0.0026
     g["TRINQUETE_BE_NETO_PCT"] = 0.00075
-    g["TRINQUETE_RATCHET_ACTIVACION_PCT"] = 0.0032
-    g["TRAILING_ACTIVACION_PCT"] = 0.0038
-    g["TRAILING_DISTANCIA_PCT"] = 0.0012
-    g["ESCUDO_MAKER_FASE2_SEG"] = 58.0
-    g["MAKER_SCRATCH_TIEMPO_SEG"] = 22.0
-    g["SL_INTERNO_PCT"] = 0.0032
-    g["TIEMPO_MAX_HOLD_SEG"] = 95.0
+    g["TRINQUETE_RATCHET_ACTIVACION_PCT"] = 0.0030
+    g["TRAILING_ACTIVACION_PCT"] = 0.0036
+    g["TRAILING_DISTANCIA_PCT"] = 0.0011
+    g["ESCUDO_MAKER_FASE2_SEG"] = 90.0
+    g["MAKER_SCRATCH_TIEMPO_SEG"] = 55.0
+    g["SL_INTERNO_PCT"] = 0.0034
+    g["TIEMPO_MAX_HOLD_SEG"] = 150.0
     g["COOLDOWN_POST_CIERRE_WIN_SEG"] = 20.0
-    g["COOLDOWN_POST_CIERRE_LOSS_SEG"] = 90.0
-    lim = g.get("_LIMITES_SHADOW_GATE")
-    if isinstance(lim, dict):
-        lim["KELLY_FRACCION_BASE"] = (0.55, 0.62)
-        lim["Z_SCORE_UMBRAL_HIGH_BETA"] = (-3.60, -2.80)
-        lim["Z_SCORE_UMBRAL_TIER1"] = (-3.30, -2.45)
-        lim["OFI_MIN_ENTRADA"] = (0.18, 0.45)
-        lim["COSECHA_TRIZ_ACTIVACION_PCT"] = (0.0025, 0.0035)
-        lim["SL_INTERNO_PCT"] = (0.0028, 0.0036)
+    g["COOLDOWN_POST_CIERRE_LOSS_SEG"] = 75.0
 
 
 def recargar_calibracion_oos_si_cambio(ruta_json: pathlib.Path | None = None) -> Dict[str, Any]:
@@ -444,13 +437,15 @@ def recargar_calibracion_oos_si_cambio(ruta_json: pathlib.Path | None = None) ->
                 aplicados[clave] = valor_clamped
 
         if not es_modo_test():
-            _aplicar_parametros_produccion_phantom()
-            aplicados["KELLY_FRACCION_BASE"] = g["KELLY_FRACCION_BASE"]
+            # Protege los pisos de supervivencia V7.2 sin pisar ajustes validos
+            g["MAKER_SCRATCH_TIEMPO_SEG"] = max(50.0, float(g.get("MAKER_SCRATCH_TIEMPO_SEG", 55.0)))
+            g["TIEMPO_MAX_HOLD_SEG"] = max(135.0, float(g.get("TIEMPO_MAX_HOLD_SEG", 150.0)))
+            g["COSECHA_TRIZ_ACTIVACION_PCT"] = min(0.0028, float(g.get("COSECHA_TRIZ_ACTIVACION_PCT", 0.0026)))
+            g["SL_INTERNO_PCT"] = max(0.0032, min(0.0038, float(g.get("SL_INTERNO_PCT", 0.0034))))
+            aplicados["MAKER_SCRATCH_TIEMPO_SEG"] = g["MAKER_SCRATCH_TIEMPO_SEG"]
+            aplicados["TIEMPO_MAX_HOLD_SEG"] = g["TIEMPO_MAX_HOLD_SEG"]
             aplicados["COSECHA_TRIZ_ACTIVACION_PCT"] = g["COSECHA_TRIZ_ACTIVACION_PCT"]
             aplicados["SL_INTERNO_PCT"] = g["SL_INTERNO_PCT"]
-            aplicados["OFI_MIN_ENTRADA"] = g["OFI_MIN_ENTRADA"]
-            aplicados["Z_SCORE_UMBRAL_HIGH_BETA"] = g["Z_SCORE_UMBRAL_HIGH_BETA"]
-            aplicados["Z_SCORE_UMBRAL_TIER1"] = g["Z_SCORE_UMBRAL_TIER1"]
 
         _ULTIMO_MTIME_OOS = mtime_actual
         return {"recargado": True, "aplicados": aplicados, "mtime": mtime_actual}
