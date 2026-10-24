@@ -1,0 +1,17 @@
+{
+    "timestamp_utc": "2026-10-23T23:35:00+00:00",
+    "sistema": "OMEGA-PHANTOM V7.0 (Apex-Chronos Singularity)",
+    "lambda_bayes": 1.0,
+    "n_trades_analizados": 97,
+    "ahorro_maker_scratch_usdt": 0.8813,
+    "parametros": {
+        "KELLY_FRACCION_BASE": 0.60,
+        "Z_SCORE_UMBRAL_HIGH_BETA": -2.85,
+        "Z_SCORE_UMBRAL_TIER1": -2.55,
+        "OFI_MIN_ENTRADA": 0.18,
+        "MAKER_SCRATCH_TIEMPO_SEG": 18.0,
+        "COSECHA_TRIZ_ACTIVACION_PCT": 0.0044,
+        "SL_INTERNO_PCT": 0.0030,
+        "TIEMPO_MAX_HOLD_SEG": 84.0
+    }
+}
