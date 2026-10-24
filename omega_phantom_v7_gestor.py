@@ -6,8 +6,9 @@ ARCHIVO #08: omega_phantom_v7_gestor.py
 SISTEMA: OMEGA-PHANTOM V7.0 (APEX-CHRONOS SINGULARITY)
 ==============================================================================
 Guardian de Custodia Multi-Slot, Geometria Campeona (+0.44% / 45s / -0.30%),
-Protocolo Chain-Jail (6 Eslabones hasta +8.00%), Paridad Taker/UTA 1:1
-(SCAR-LOCK-04), Captura de retCode: 110017 y Consola Forense CLI `veromega`.
+Protocolo Chain-Jail (6 Eslabones hasta +8.00%), Ejecucion Real de Cosecha 50%
+y Salidas Verificadas en Bybit UTA con Re-Peg a 1.8s + Respaldo Zero-Orphan,
+Paridad Taker/UTA 1:1 (SCAR-LOCK-04) y Consola Forense CLI `veromega`.
 ==============================================================================
 """
 from __future__ import annotations
@@ -15,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import subprocess
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -57,10 +57,6 @@ def evaluar_reloj_actividad_maker_scratch(
     side: str,
     ticks_activos: int = 0,
 ) -> bool:
-    """
-    Ley 2 (Test Secuencial de Wald a los 18s):
-    Determina si la posicion carece de traccion y debe evacuarse en Limit PostOnly.
-    """
     if float(edad_seg) < cfg.MAKER_SCRATCH_TIEMPO_SEG:
         return False
     if float(pnl_bruto_pct) > cfg.MAKER_SCRATCH_PNL_MAX_PCT:
@@ -101,15 +97,15 @@ class GestorPosiciones:
         precio_fallback: float,
     ) -> float:
         """
-        SCAR-LOCK-04: Espera 120ms y consulta fetch_order para obtener el
-        average fill price exacto de una orden Market en Bybit UTA.
+        SCAR-LOCK-04: Espera 120ms y consulta fetch_order con acknowledged=True
+        para obtener el average fill price exacto de una orden Market en Bybit UTA.
         """
         if self.exchange is None or not order_id:
             return precio_fallback
         try:
             if not cfg.es_modo_test():
                 await asyncio.sleep(0.120)
-            ord_info = await self.exchange.fetch_order(order_id, symbol)
+            ord_info = await EJECUTOR_SNIPER._consultar_orden_segura(order_id, symbol)
             if isinstance(ord_info, dict):
                 avg = float(ord_info.get("average", 0.0) or ord_info.get("price", 0.0) or 0.0)
                 if avg > 0.0:
@@ -117,6 +113,61 @@ class GestorPosiciones:
         except Exception:
             pass
         return precio_fallback
+
+    async def _ejecutar_orden_cosecha_50_bybit(
+        self,
+        pos: PosicionActiva,
+        qty_mitad: float,
+        px_cosecha: float,
+    ) -> Tuple[bool, float, bool]:
+        """
+        Envia la orden real reduceOnly=True del 50% a Bybit en produccion.
+        Retorna (exito, precio_ejecutado, fue_maker).
+        """
+        if self.exchange is None or cfg.es_modo_test():
+            return True, px_cosecha, True
+
+        side_cierre = "sell" if pos.side == "long" else "buy"
+        try:
+            ord_lim = await self.exchange.create_order(
+                symbol=pos.symbol,
+                type="limit",
+                side=side_cierre,
+                amount=qty_mitad,
+                price=px_cosecha,
+                params={"timeInForce": "PostOnly", "reduceOnly": True},
+            )
+            oid = str(ord_lim.get("id", "")) if isinstance(ord_lim, dict) else ""
+            if oid:
+                t0 = time.time()
+                while (time.time() - t0) < 1.80:
+                    await asyncio.sleep(0.18)
+                    est = await EJECUTOR_SNIPER._consultar_orden_segura(oid, pos.symbol)
+                    st = str(est.get("status", "")).lower()
+                    filled = float(est.get("filled", 0.0) or 0.0)
+                    avg = float(est.get("average", 0.0) or px_cosecha)
+                    if st in ("closed", "filled") or filled >= qty_mitad * 0.95:
+                        return True, (avg if avg > 0.0 else px_cosecha), True
+                    if st in ("canceled", "cancelled", "rejected"):
+                        break
+                try:
+                    await self.exchange.cancel_order(oid, pos.symbol)
+                except Exception:
+                    pass
+
+            ord_mkt = await self.exchange.create_order(
+                symbol=pos.symbol,
+                type="market",
+                side=side_cierre,
+                amount=qty_mitad,
+                params={"reduceOnly": True},
+            )
+            oid_m = str(ord_mkt.get("id", "")) if isinstance(ord_mkt, dict) else ""
+            px_m = await self._obtener_precio_real_orden_market(pos.symbol, oid_m, px_cosecha)
+            return True, px_m, False
+        except Exception as exc:
+            log_sniper(f"[GESTOR COSECHA WARN] {pos.symbol}: {exc}")
+            return False, px_cosecha, False
 
     async def _ejecutar_cierre_posicion(
         self,
@@ -130,35 +181,93 @@ class GestorPosiciones:
 
         side_cierre = "sell" if pos.side == "long" else "buy"
         px_final = EJECUTOR_SNIPER.redondear_precio(pos.symbol, precio_salida)
+        es_maker_real = es_maker
 
         if self.exchange is not None:
             try:
-                if es_maker:
-                    await self.exchange.create_order(
-                        symbol=pos.symbol,
-                        type="limit",
-                        side=side_cierre,
-                        amount=pos.qty_actual,
-                        price=px_final,
-                        params={"timeInForce": "PostOnly", "reduceOnly": True},
-                    )
+                if cfg.es_modo_test():
+                    if es_maker:
+                        await self.exchange.create_order(
+                            symbol=pos.symbol,
+                            type="limit",
+                            side=side_cierre,
+                            amount=pos.qty_actual,
+                            price=px_final,
+                            params={"timeInForce": "PostOnly", "reduceOnly": True},
+                        )
+                    else:
+                        orden_mkt = await self.exchange.create_order(
+                            symbol=pos.symbol,
+                            type="market",
+                            side=side_cierre,
+                            amount=pos.qty_actual,
+                            params={"reduceOnly": True},
+                        )
+                        ord_id = str(orden_mkt.get("id", "")) if isinstance(orden_mkt, dict) else ""
+                        px_final = await self._obtener_precio_real_orden_market(
+                            pos.symbol, ord_id, px_final
+                        )
                 else:
-                    orden_mkt = await self.exchange.create_order(
-                        symbol=pos.symbol,
-                        type="market",
-                        side=side_cierre,
-                        amount=pos.qty_actual,
-                        params={"reduceOnly": True},
-                    )
-                    ord_id = str(orden_mkt.get("id", "")) if isinstance(orden_mkt, dict) else ""
-                    px_final = await self._obtener_precio_real_orden_market(
-                        pos.symbol, ord_id, px_final
-                    )
+                    cerrada_en_exchange = False
+                    if es_maker:
+                        tk = ESTADO_RAM.ticks_ram.get(pos.symbol)
+                        if tk and tk.bid > 0.0 and tk.ask > tk.bid:
+                            px_final = EJECUTOR_SNIPER.calcular_cotizacion_penny_jump(
+                                symbol=pos.symbol,
+                                side="short" if pos.side == "long" else "long",
+                                best_bid=tk.bid,
+                                best_ask=tk.ask,
+                                ofi=tk.ofi_l1_l5,
+                                sigma_bv=tk.volatilidad_local,
+                            )
+                        ord_lim = await self.exchange.create_order(
+                            symbol=pos.symbol,
+                            type="limit",
+                            side=side_cierre,
+                            amount=pos.qty_actual,
+                            price=px_final,
+                            params={"timeInForce": "PostOnly", "reduceOnly": True},
+                        )
+                        oid_c = str(ord_lim.get("id", "")) if isinstance(ord_lim, dict) else ""
+                        if oid_c:
+                            t_c0 = time.time()
+                            while (time.time() - t_c0) < 2.80:
+                                await asyncio.sleep(0.20)
+                                est_c = await EJECUTOR_SNIPER._consultar_orden_segura(oid_c, pos.symbol)
+                                st_c = str(est_c.get("status", "")).lower()
+                                fill_c = float(est_c.get("filled", 0.0) or 0.0)
+                                avg_c = float(est_c.get("average", 0.0) or px_final)
+                                if st_c in ("closed", "filled") or fill_c >= pos.qty_actual * 0.98:
+                                    px_final = avg_c if avg_c > 0.0 else px_final
+                                    cerrada_en_exchange = True
+                                    es_maker_real = True
+                                    break
+                                if st_c in ("canceled", "cancelled", "rejected"):
+                                    break
+                            if not cerrada_en_exchange:
+                                try:
+                                    await self.exchange.cancel_order(oid_c, pos.symbol)
+                                except Exception:
+                                    pass
+
+                    if not cerrada_en_exchange:
+                        orden_mkt = await self.exchange.create_order(
+                            symbol=pos.symbol,
+                            type="market",
+                            side=side_cierre,
+                            amount=pos.qty_actual,
+                            params={"reduceOnly": True},
+                        )
+                        ord_id = str(orden_mkt.get("id", "")) if isinstance(orden_mkt, dict) else ""
+                        px_final = await self._obtener_precio_real_orden_market(
+                            pos.symbol, ord_id, px_final
+                        )
+                        es_maker_real = False
             except Exception as exc:
                 msg_err = str(exc)
                 if "110017" in msg_err or "position is zero" in msg_err.lower() or "ordernotfound" in msg_err.lower():
                     motivo = "SL_EXCHANGE"
-                    es_maker = False
+                    es_maker_real = False
                     px_final = pos.sl_bybit_price if pos.sl_bybit_price > 0.0 else px_final
                 else:
                     log_sniper(f"[GESTOR WARN] Error cerrando {pos.symbol}: {exc}")
@@ -167,7 +276,7 @@ class GestorPosiciones:
             pos=pos,
             exit_price=px_final,
             motivo=motivo,
-            es_maker_salida=es_maker,
+            es_maker_salida=es_maker_real,
         )
         if registro is not None:
             if pos.side == "short" and registro.pnl_usdt < 0.0:
@@ -210,7 +319,6 @@ class GestorPosiciones:
         pnl_pct = pos.calcular_pnl_bruto_pct(precio_actual)
         pos.actualizar_anatomia_intratrade(pnl_pct, edad_seg)
 
-        # 1. Stop-Loss Quirurgico Interno (-0.30% en produccion / -0.48% en test)
         if not pos.trinquete_be_armado and pnl_pct <= -cfg.SL_INTERNO_PCT:
             await self._ejecutar_cierre_posicion(
                 pos=pos,
@@ -220,7 +328,6 @@ class GestorPosiciones:
             )
             return
 
-        # 2. Si el Trinquete Break-Even o Ratchet esta armado y el precio retrocede al piso
         if pos.trinquete_be_armado:
             toco_piso_be = (
                 (pos.side == "long" and precio_actual <= pos.sl_interno_price)
@@ -236,11 +343,11 @@ class GestorPosiciones:
                 )
                 return
 
-        # 3. Cosecha 50% TRIZ PostOnly (+0.44% en produccion / +0.26% en test) y armado de BE+
         if not pos.cosecha_50_ejecutada and pnl_pct >= cfg.COSECHA_TRIZ_ACTIVACION_PCT:
             piso_be = self._calcular_precio_piso_be(pos)
             pos.sl_interno_price = piso_be
             pos.trinquete_be_armado = True
+            await EJECUTOR_SNIPER._colocar_stop_loss_servidor_bybit(pos.symbol, pos.side, piso_be)
             log_sniper(
                 f"[FRANCOTIRADOR] [SHIELD] {pos.symbol} Trinquete Break-Even armado: SL {piso_be} (PnL {pnl_pct*100:+.2f}%)"
             )
@@ -250,31 +357,36 @@ class GestorPosiciones:
             )
             if 0.0 < qty_mitad < pos.qty_actual:
                 px_cosecha = EJECUTOR_SNIPER.redondear_precio(pos.symbol, precio_actual)
-                nocional_mitad = qty_mitad * pos.entry_price
-                fee_mitad = nocional_mitad * (2.0 * cfg.FEE_MAKER_PCT)
-                pnl_mitad_usdt = round((nocional_mitad * pnl_pct) - fee_mitad, 4)
-
-                pos.qty_actual = round(pos.qty_actual - qty_mitad, 6)
-                pos.cosecha_50_ejecutada = True
-                pos.ts_cosecha_50 = t_now
-                pos.modo_cosecha_ejecutado = "ESCALERA_50_25_25"
-                CAJA_NEGRA.registrar_cosecha_parcial_en_vivo(pos, pnl_mitad_usdt, fee_mitad)
-
-                await TELEMETRIA_TG.notificar_cosecha_parcial(
-                    symbol=pos.symbol,
-                    side=pos.side,
-                    qty_cosechada=qty_mitad,
-                    precio_cosecha=px_cosecha,
-                    pnl_pct=pnl_pct,
-                    pnl_usdt=pnl_mitad_usdt,
+                ok_c, px_real_c, fue_mkr_c = await self._ejecutar_orden_cosecha_50_bybit(
+                    pos, qty_mitad, px_cosecha
                 )
-                log_sniper(
-                    f"[FRANCOTIRADOR] [DIAMOND] {pos.symbol} Cosecha 50% TRIZ PostOnly ejecutada: "
-                    f"{qty_mitad} @ {px_cosecha} ({pnl_pct*100:+.2f}% | {pnl_mitad_usdt:+.4f} USDT). "
-                    f"Restan {pos.qty_actual} contratos en Escalera 50/25/25."
-                )
+                if ok_c:
+                    nocional_mitad = qty_mitad * pos.entry_price
+                    fee_salida_c = cfg.FEE_MAKER_PCT if fue_mkr_c else cfg.FEE_TAKER_PCT
+                    fee_mitad = nocional_mitad * (cfg.FEE_MAKER_PCT + fee_salida_c)
+                    pnl_bruto_c = pos.calcular_pnl_bruto_pct(px_real_c)
+                    pnl_mitad_usdt = round((nocional_mitad * pnl_bruto_c) - fee_mitad, 4)
 
-        # 4. Escalera Chain-Jail (6 Eslabones) y Trailing Ratchet (+0.65%)
+                    pos.qty_actual = round(pos.qty_actual - qty_mitad, 6)
+                    pos.cosecha_50_ejecutada = True
+                    pos.ts_cosecha_50 = t_now
+                    pos.modo_cosecha_ejecutado = "ESCALERA_50_25_25"
+                    CAJA_NEGRA.registrar_cosecha_parcial_en_vivo(pos, pnl_mitad_usdt, fee_mitad)
+
+                    await TELEMETRIA_TG.notificar_cosecha_parcial(
+                        symbol=pos.symbol,
+                        side=pos.side,
+                        qty_cosechada=qty_mitad,
+                        precio_cosecha=px_real_c,
+                        pnl_pct=pnl_bruto_c,
+                        pnl_usdt=pnl_mitad_usdt,
+                    )
+                    log_sniper(
+                        f"[FRANCOTIRADOR] [DIAMOND] {pos.symbol} Cosecha 50% TRIZ PostOnly ejecutada: "
+                        f"{qty_mitad} @ {px_real_c} ({pnl_bruto_c*100:+.2f}% | {pnl_mitad_usdt:+.4f} USDT). "
+                        f"Restan {pos.qty_actual} contratos en Escalera 50/25/25."
+                    )
+
         eslabon, _, piso_cj_pct = calcular_eslabon_chain_jail(pnl_pct)
         if eslabon > pos.eslabon_chain_jail:
             pos.eslabon_chain_jail = eslabon
@@ -304,7 +416,6 @@ class GestorPosiciones:
                     pos.sl_interno_price = cand_sl
             pos.trinquete_be_armado = True
 
-        # 5. Ley 2: Maker-Scratch Pasivo a los 18s (Continuous Wald Scratch)
         if not pos.cosecha_50_ejecutada and evaluar_reloj_actividad_maker_scratch(
             edad_seg=edad_seg,
             pnl_bruto_pct=pnl_pct,
@@ -327,7 +438,6 @@ class GestorPosiciones:
             )
             return
 
-        # 6. Early Stagnation Maker Unwind a los 45.0s (SCAR-LOCK-12b) y limite de Hold (84s)
         if not cfg.es_modo_test() and not pos.cosecha_50_ejecutada and edad_seg >= cfg.ESCUDO_MAKER_FASE2_SEG:
             if -0.0012 <= pnl_pct <= 0.0018:
                 await self._ejecutar_cierre_posicion(
@@ -368,9 +478,6 @@ class GestorPosiciones:
 GESTOR_POSICIONES: GestorPosiciones = GestorPosiciones()
 
 
-# ==============================================================================
-# CONSOLA FORENSE INTERACTIVA CLI `veromega` (-s, -x, -t, -h, -b)
-# ==============================================================================
 def imprimir_baul_ia_cli_veromega() -> None:
     ruta_baul = cfg.ROOT_DIR / "omega_phantom_v7_baul_ia.jsonl"
     print("-" * 102)
@@ -412,7 +519,8 @@ def imprimir_status_cli_veromega() -> None:
     pid_str = "OFFLINE"
     lock_file = cfg.ROOT_DIR / cfg.ARCHIVO_LOCK_PRODUCCION
     if lock_file.exists():
-        pid_str = lock_file.read_text(encoding="utf-8").strip()
+        lineas = lock_file.read_text(encoding="utf-8").splitlines()
+        pid_str = lineas[0].strip() if lineas else "OFFLINE"
 
     print("=" * 102)
     print(f" OMEGA-PHANTOM V7.0 -- PANEL FORENSE EN TIEMPO REAL [DESAFIO 48H: 10.00 -> 14.00 USDT]")

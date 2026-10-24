@@ -7,11 +7,12 @@ SISTEMA: OMEGA-PHANTOM V7.0 (APEX-CHRONOS SINGULARITY)
 ==============================================================================
 Motor de Disparo Zero-REST con:
   1. Precio de Reserva Dinamico de Avellaneda-Stoikov modificado por Hawkes.
-  2. Particion Dual-Layer Iceberg (60% L1 + 40% L2) para romper el techo de
-     16.50 USDT en High-Beta cuando el Acelerador House-Money esta activo.
-  3. Vigilancia de Cola de Moallemi-Yuan (TTL=3.80s en produccion / 2.20s en
-     test) con Re-Pegging pasivo unico a 1.80s (SCAR-LOCK-06) y abolicion
-     total del Re-Quote Taker (SCAR-LOCK-00).
+  2. Consulta Bybit V5 `fetch_order(..., {"acknowledged": True})` blindada
+     contra excepciones CCXT + verificacion de respaldo en `fetch_positions`.
+  3. Stop-Loss fisico en servidor Bybit V5 via `private_post_v5_position_trading_stop`
+     (MarkPrice, positionIdx=0).
+  4. Vigilancia de Cola de Moallemi-Yuan (TTL=3.80s en produccion / 2.20s en
+     test) con Re-Pegging pasivo unico a 1.80s (SCAR-LOCK-06).
 ==============================================================================
 """
 from __future__ import annotations
@@ -135,17 +136,62 @@ class EjecutorSniper:
             return f"SIM_{int(time.time()*1000)}", (time.perf_counter() - t0) * 1000.0
 
         params = {"timeInForce": "PostOnly", "reduceOnly": False}
-        orden = await self.exchange.create_order(
-            symbol=symbol,
-            type="limit",
-            side=side_orden,
-            amount=qty,
-            price=precio,
-            params=params,
-        )
-        rtt_ms = (time.perf_counter() - t0) * 1000.0
-        order_id = str(orden.get("id", "")) if isinstance(orden, dict) else ""
-        return (order_id if order_id else None), rtt_ms
+        try:
+            orden = await self.exchange.create_order(
+                symbol=symbol,
+                type="limit",
+                side=side_orden,
+                amount=qty,
+                price=precio,
+                params=params,
+            )
+            rtt_ms = (time.perf_counter() - t0) * 1000.0
+            order_id = str(orden.get("id", "")) if isinstance(orden, dict) else ""
+            return (order_id if order_id else None), rtt_ms
+        except Exception as exc:
+            log_sniper(f"[SNIPER ORDEN WARN] Bybit rechazo create_order en {symbol} ({qty} @ {precio}): {exc}")
+            return None, (time.perf_counter() - t0) * 1000.0
+
+    async def _consultar_orden_segura(self, order_id: str, symbol: str) -> Dict[str, Any]:
+        if self.exchange is None or not order_id:
+            return {"status": "open", "filled": 0.0, "average": 0.0}
+        try:
+            if cfg.es_modo_test():
+                return await self.exchange.fetch_order(order_id, symbol)
+            return await self.exchange.fetch_order(order_id, symbol, {"acknowledged": True})
+        except TypeError:
+            try:
+                return await self.exchange.fetch_order(order_id, symbol)
+            except Exception:
+                return {"status": "unknown", "filled": 0.0, "average": 0.0}
+        except Exception:
+            return {"status": "unknown", "filled": 0.0, "average": 0.0}
+
+    async def _verificar_posicion_abierta_bybit(
+        self,
+        symbol: str,
+        precio_fallback: float,
+    ) -> Tuple[float, float]:
+        if self.exchange is None or cfg.es_modo_test():
+            return 0.0, precio_fallback
+        try:
+            raw_sym = symbol.split("/")[0] + "USDT"
+            posiciones = await self.exchange.fetch_positions(
+                None, {"category": "linear", "symbol": raw_sym}
+            )
+            for p in posiciones or []:
+                if str(p.get("symbol", "")) == symbol or str(p.get("info", {}).get("symbol", "")) == raw_sym:
+                    contracts = float(p.get("contracts", 0.0) or p.get("info", {}).get("size", 0.0) or 0.0)
+                    avg_px = float(
+                        p.get("entryPrice", 0.0)
+                        or p.get("info", {}).get("avgPrice", 0.0)
+                        or precio_fallback
+                    )
+                    if contracts > 0.0:
+                        return contracts, (avg_px if avg_px > 0.0 else precio_fallback)
+        except Exception:
+            pass
+        return 0.0, precio_fallback
 
     async def _colocar_stop_loss_servidor_bybit(
         self,
@@ -155,7 +201,19 @@ class EjecutorSniper:
     ) -> bool:
         if self.exchange is None:
             return True
+        raw_sym = symbol.split("/")[0] + "USDT"
         try:
+            if hasattr(self.exchange, "private_post_v5_position_trading_stop"):
+                await self.exchange.private_post_v5_position_trading_stop(
+                    {
+                        "category": "linear",
+                        "symbol": raw_sym,
+                        "stopLoss": str(sl_price),
+                        "slTriggerBy": "MarkPrice",
+                        "positionIdx": 0,
+                    }
+                )
+                return True
             if hasattr(self.exchange, "set_trading_stop"):
                 await self.exchange.set_trading_stop(
                     symbol=symbol,
@@ -232,18 +290,21 @@ class EjecutorSniper:
             if not order_id_l1:
                 return None
 
+            log_sniper(
+                f"[FRANCOTIRADOR ORDEN] {order_id_l1} en {symbol} [{side.upper()}]: "
+                f"{qty_l1} @ {precio_quote} (nocional ~{nocional_real:.2f} USDT, {cfg.APALANCAMIENTO_BASE}x, "
+                f"Kelly={fraccion_kelly*100:.0f}%, Z={z_score:+.2f}, OFI={ofi:+.2f}, RTT={rtt_ms:.1f}ms)"
+            )
+
             if qty_l2 > 0.0 and self.exchange is not None:
                 offset_l2 = -0.0008 if side == "long" else 0.0008
                 precio_l2 = self.redondear_precio(symbol, precio_quote * (1.0 + offset_l2))
-                try:
-                    order_id_l2, _ = await self._colocar_orden_limit_postonly(
-                        symbol=symbol,
-                        side_orden=side_orden,
-                        qty=qty_l2,
-                        precio=precio_l2,
-                    )
-                except Exception:
-                    order_id_l2 = None
+                order_id_l2, _ = await self._colocar_orden_limit_postonly(
+                    symbol=symbol,
+                    side_orden=side_orden,
+                    qty=qty_l2,
+                    precio=precio_l2,
+                )
 
             TELEMETRIA_TG.registrar_apertura_pendiente(
                 symbol=symbol,
@@ -262,7 +323,7 @@ class EjecutorSniper:
             )
 
             ttl_max = float(cfg.TTL_ORDEN_ENTRADA_SEG)
-            paso_poll = 0.10 if cfg.es_modo_test() else 0.15
+            paso_poll = 0.10 if cfg.es_modo_test() else 0.18
             t_inicio_cola = time.time()
             qty_llenada = 0.0
             precio_llenado = precio_quote
@@ -274,7 +335,7 @@ class EjecutorSniper:
                     qty_llenada = qty_l1
                     break
 
-                estado_ord = await self.exchange.fetch_order(order_id_l1, symbol)
+                estado_ord = await self._consultar_orden_segura(order_id_l1, symbol)
                 status = str(estado_ord.get("status", "")).lower()
                 filled = float(estado_ord.get("filled", 0.0) or 0.0)
                 avg_px = float(estado_ord.get("average", 0.0) or estado_ord.get("price", precio_quote) or precio_quote)
@@ -294,11 +355,17 @@ class EjecutorSniper:
                 tk_now = ESTADO_RAM.ticks_ram.get(symbol)
                 if tk_now is not None:
                     if side == "long" and tk_now.ofi_l1_l5 <= cfg.OFI_ABORTAR_COLA_UMBRAL:
-                        await self.exchange.cancel_order(order_id_l1, symbol)
+                        try:
+                            await self.exchange.cancel_order(order_id_l1, symbol)
+                        except Exception:
+                            pass
                         ya_cancelada_l1 = True
                         break
                     if side == "short" and tk_now.ofi_l1_l5 >= abs(cfg.OFI_ABORTAR_COLA_UMBRAL):
-                        await self.exchange.cancel_order(order_id_l1, symbol)
+                        try:
+                            await self.exchange.cancel_order(order_id_l1, symbol)
+                        except Exception:
+                            pass
                         ya_cancelada_l1 = True
                         break
 
@@ -340,10 +407,10 @@ class EjecutorSniper:
 
             if order_id_l2 and self.exchange is not None:
                 try:
-                    est_l2 = await self.exchange.fetch_order(order_id_l2, symbol)
+                    est_l2 = await self._consultar_orden_segura(order_id_l2, symbol)
                     fill_l2 = float(est_l2.get("filled", 0.0) or 0.0)
                     avg_l2 = float(est_l2.get("average", 0.0) or precio_quote)
-                    if str(est_l2.get("status", "")).lower() == "open":
+                    if str(est_l2.get("status", "")).lower() in ("open", "unknown"):
                         await self.exchange.cancel_order(order_id_l2, symbol)
                     if fill_l2 > 0.0:
                         tot_q = qty_llenada + fill_l2
@@ -358,11 +425,18 @@ class EjecutorSniper:
                         await self.exchange.cancel_order(order_id_l1, symbol)
                     except Exception:
                         pass
-                TELEMETRIA_TG.descartar_apertura_no_llenada(symbol)
-                log_sniper(
-                    f"[COLA MOALLEMI-YUAN] Orden en {symbol} no llenada en {ttl_max:.1f}s (Cero Re-Quote): margen liberado."
-                )
-                return None
+
+                # Verificacion final de seguridad en Bybit UTA por si lleno justo al cancelar
+                q_pos, px_pos = await self._verificar_posicion_abierta_bybit(symbol, precio_quote)
+                if q_pos > 0.0:
+                    qty_llenada = q_pos
+                    precio_llenado = px_pos
+                else:
+                    TELEMETRIA_TG.descartar_apertura_no_llenada(symbol)
+                    log_sniper(
+                        f"[COLA MOALLEMI-YUAN] Orden en {symbol} no llenada en {ttl_max:.1f}s (Cero Re-Quote): margen liberado."
+                    )
+                    return None
 
             if side == "long":
                 sl_interno = self.redondear_precio(symbol, precio_llenado * (1.0 - cfg.SL_INTERNO_PCT))
@@ -416,6 +490,9 @@ class EjecutorSniper:
                 f"{qty_llenada} @ {precio_llenado} (SL Int: {sl_interno} | SL Bybit: {sl_bybit})"
             )
             return posicion_creada
+        except Exception as exc:
+            log_sniper(f"[SNIPER ERROR] Excepcion en ejecutar_senal_sniper ({symbol}): {exc}")
+            return None
         finally:
             if posicion_creada is None:
                 ESTADO_RAM.liberar_margen_atomico(symbol, margen_real)

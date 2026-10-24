@@ -9,12 +9,9 @@ Motor Tensorial de Microestructura L2 + publicTrade a 50 Hz (20 ms):
   1. Reloj de Eventos L2 (Event-Driven Book Clock): filtra instantaneas L2
      identicas en produccion para preservar la racha de confirmacion H-OFI y
      evalua delta_p_pct sobre horizonte biescala real (3.0s a 12.0s).
-  2. Variacion Bipower de Barndorff-Nielsen & Shephard (inmune a saltos).
-  3. Exponente de Rugosidad Fractal de Hurst por Razon de Eficiencia Winsorizada.
-  4. Repulsor Cinetico de Lyapunov (segunda derivada del precio) y Memoria de
-     Absorcion Auto-Excitada de Hawkes.
-  5. Modulacion continua por Percentil del Dia P_dia(t, sigma_BV) y blindaje
-     de los 14 cerrojos inmutables SCAR-LOCK-00 a SCAR-LOCK-13.
+  2. Supresor de Rafaga Post-Disparo (12.0s cooldown por simbolo tras emitir
+     senal en produccion) para impedir disparos duplicados en vuelo.
+  3. Variacion Bipower, Hurst Winsorizado, Lyapunov, Hawkes y SCAR-LOCK-00..13.
 ==============================================================================
 """
 from __future__ import annotations
@@ -42,20 +39,16 @@ def calcular_percentil_intradia_utc(
     ahora: Optional[float] = None,
     sigma_bv: float = 0.00060,
 ) -> Tuple[float, str, float]:
-    """
-    Calcula en O(1) la curva horaria compuesta H_UTC(t) mediante 5 nucleos
-    gaussianos institucionales y el Percentil Continuo del Dia P_dia in [0.05, 0.99].
-    """
     t_now = float(ahora) if ahora is not None else time.time()
     dt_utc = datetime.fromtimestamp(t_now, tz=timezone.utc)
     h_utc = dt_utc.hour + (dt_utc.minute / 60.0) + (dt_utc.second / 3600.0)
 
     nucleos = (
-        (0.00, 0.85, 0.90),   # 00:00 UTC Apertura Asia + Funding
-        (8.00, 1.10, 0.92),   # 08:00 UTC Apertura Londres + Funding
-        (13.75, 1.65, 0.98),  # 13:45 UTC Apertura Wall Street NYSE
-        (16.00, 1.15, 0.88),  # 16:00 UTC Cierre Londres + Funding
-        (24.00, 0.85, 0.90),  # 24:00 UTC Medianoche Asia
+        (0.00, 0.85, 0.90),
+        (8.00, 1.10, 0.92),
+        (13.75, 1.65, 0.98),
+        (16.00, 1.15, 0.88),
+        (24.00, 0.85, 0.90),
     )
     max_g = 0.0
     for mu, sigma, peso in nucleos:
@@ -71,10 +64,7 @@ def calcular_percentil_intradia_utc(
 
 
 class VentanaZ:
-    """
-    Estructura deslizante O(1) por activo con Reloj de Eventos L2 y ventana
-    temporal biescala para Z-Score Bipower, EMA900, H-OFI, Hurst, Lyapunov y Hawkes.
-    """
+    """Estructura deslizante O(1) por activo con Reloj de Eventos L2."""
 
     def __init__(self, symbol: str, maxlen: int = cfg.VENTANA_Z_TICKS) -> None:
         self.symbol: str = symbol
@@ -99,6 +89,7 @@ class VentanaZ:
         self.ts_ultima_replica_lyapunov: float = 0.0
         self.ts_ultimo_anti_squeeze: float = 0.0
         self.px_ultimo_anti_squeeze: float = 0.0
+        self.ts_ultimo_disparo: float = 0.0
 
         self.ofi_ticks_long: int = 0
         self.ofi_ticks_short: int = 0
@@ -213,11 +204,6 @@ class VentanaZ:
         return v1 - v0
 
     def _calcular_delta_p_biescala(self, mid_price: float, ahora: float) -> float:
-        """
-        En modo test usa el primer elemento de self.precios (compatibilidad 18/18).
-        En produccion a 50Hz evalua la mayor excursion firmada tanto sobre la
-        cola de 60 eventos como sobre la ventana cronologica [2.5s .. 14.0s].
-        """
         p_base_ticks = self.precios[0] if self.precios else mid_price
         dp_ticks = (mid_price - p_base_ticks) / p_base_ticks if p_base_ticks > 0.0 else 0.0
         if cfg.es_modo_test() or len(self.precios_ts) < 4:
@@ -245,8 +231,6 @@ class VentanaZ:
         if mid_price <= 0.0:
             return {}
 
-        # Reloj de Eventos L2: En produccion, si el libro L1-L5 es 100% identico
-        # a la muestra anterior y han pasado < 150ms, no contamina la ventana con 0s.
         if (
             not cfg.es_modo_test()
             and self.prev_bids
@@ -483,6 +467,10 @@ class RadarVolatilidad:
         if not es_test and symbol == "INJ/USDT:USDT":
             return None
 
+        # Supresor de rafaga: 12.0s entre disparos del mismo simbolo en produccion
+        if not es_test and (t_now - ventana.ts_ultimo_disparo) < 12.0:
+            return None
+
         min_ticks_arranque = 20 if es_test else 30
         if ventana.ticks_totales < min_ticks_arranque:
             return None
@@ -570,6 +558,7 @@ class RadarVolatilidad:
             if not ok_perm:
                 return None
 
+            ventana.ts_ultimo_disparo = t_now
             kelly_info = ESCUDO_TRICORTEX.calcular_fraccion_kelly_antifragil(
                 symbol=symbol,
                 z_score=tk.z_score,
@@ -686,6 +675,7 @@ class RadarVolatilidad:
         if not ok_perm_s:
             return None
 
+        ventana.ts_ultimo_disparo = t_now
         kelly_info_s = ESCUDO_TRICORTEX.calcular_fraccion_kelly_antifragil(
             symbol=symbol,
             z_score=tk.z_score,

@@ -8,11 +8,10 @@ SISTEMA: OMEGA-PHANTOM V7.0 (APEX-CHRONOS SINGULARITY)
 Kernel Orquestador Asincrono sobre uvloop (Linux) / asyncio (Windows):
   1. Cerrojo Fisico de Instancia Unica (.omega_phantom_v7.lock) con verificacion
      de PID vivo en el kernel.
-  2. Reconciliacion Inteligente de Arranque en Bybit UTA con espaciado anti-WAF
-     y persistencia de Paridad Exacta 1:1 (SCAR-LOCK-04).
-  3. Streaming WebSocket Nativo Bybit V5 (wss://stream.bybit.com/v5/public/linear)
-     para `orderbook.50` (20 ms / 50 Hz) + `publicTrade` con CERO consumo de
-     cuota HTTP REST durante el escaneo microestructural.
+  2. Reconciliacion Inteligente de Arranque y Periodica en Bybit UTA: adopta
+     posiciones abiertas, coloca SL de servidor y limpia ordenes huerfanas.
+  3. Streaming WebSocket Nativo Bybit V5 (`orderbook.50` + `publicTrade`) con
+     cerrojo de tarea en vuelo para impedir disparos superpuestos.
 ==============================================================================
 """
 from __future__ import annotations
@@ -140,11 +139,11 @@ class CerrojoInstanciaUnica:
 
 async def reconciliar_posiciones_arranque(exchange: Any) -> Dict[str, Any]:
     """
-    Sincroniza el estado real de Bybit UTA al iniciar el demonio:
+    Sincroniza el estado real de Bybit UTA al iniciar el demonio y periodicamente:
       - Lee el patrimonio USDT total y libre (Paridad 1:1 SCAR-LOCK-04).
-      - Si Bybit REST esta en enfriamiento temporal, preserva el ultimo
-        balance UTA certificado en disco (10.6631 USDT).
-      - Adopta posiciones abiertas y limpia ordenes huerfanas en 1 llamada V5.
+      - Adopta cualquier posicion abierta en ESTADO_RAM.posiciones_activas y
+        asegura su Stop-Loss fisico en el servidor de Bybit.
+      - Cancela ordenes limite huerfanas en simbolos sin posicion abierta.
     """
     resultado = {
         "balance_uta_usdt": round(CAJA_NEGRA.patrimonio_real_uta_usdt, 4),
@@ -173,7 +172,7 @@ async def reconciliar_posiciones_arranque(exchange: Any) -> Dict[str, Any]:
             resultado["balance_uta_usdt"] = round(total_usdt, 4)
     except Exception as exc:
         log_sniper(
-            f"[RECONCILIACION INFO] Usando Paridad UTA Persistida ({resultado['balance_uta_usdt']:.4f} USDT) mientras enfria REST: {exc}"
+            f"[RECONCILIACION INFO] Usando Paridad UTA Persistida ({resultado['balance_uta_usdt']:.4f} USDT): {exc}"
         )
 
     simbolos_con_posicion: set[str] = set()
@@ -192,6 +191,10 @@ async def reconciliar_posiciones_arranque(exchange: Any) -> Dict[str, Any]:
             sym = str(p.get("symbol", ""))
             if not sym or sym not in cfg.PARES_CAMPEONES_ALFA:
                 continue
+            simbolos_con_posicion.add(sym)
+            if sym in ESTADO_RAM.posiciones_activas:
+                continue
+
             side = str(p.get("side", "long")).lower()
             entry_px = float(p.get("entryPrice", 0.0) or p.get("info", {}).get("avgPrice", 0.0) or 0.0)
             if entry_px <= 0.0:
@@ -203,6 +206,8 @@ async def reconciliar_posiciones_arranque(exchange: Any) -> Dict[str, Any]:
             else:
                 sl_int = EJECUTOR_SNIPER.redondear_precio(sym, entry_px * (1.0 + cfg.SL_INTERNO_PCT))
                 sl_byb = EJECUTOR_SNIPER.redondear_precio(sym, entry_px * (1.0 + cfg.SL_BYBIT_SERVIDOR_PCT))
+
+            await EJECUTOR_SNIPER._colocar_stop_loss_servidor_bybit(sym, side, sl_byb)
 
             nocional = contracts * entry_px
             margen_est = round(nocional / float(cfg.APALANCAMIENTO_BASE), 4)
@@ -219,10 +224,9 @@ async def reconciliar_posiciones_arranque(exchange: Any) -> Dict[str, Any]:
             )
             ESTADO_RAM.posiciones_activas[sym] = pos_adoptada
             ESTADO_RAM.slot_ocupado = True
-            simbolos_con_posicion.add(sym)
             resultado["adoptadas"] += 1
             log_sniper(
-                f"[RECONCILIACION UTA] Posicion adoptada en {sym} [{side.upper()}]: {contracts} @ {entry_px}"
+                f"[RECONCILIACION UTA] Posicion adoptada en {sym} [{side.upper()}]: {contracts} @ {entry_px} (SL Int: {sl_int})"
             )
     except Exception:
         pass
@@ -257,11 +261,6 @@ async def reconciliar_posiciones_arranque(exchange: Any) -> Dict[str, Any]:
 
 
 async def auditar_y_filtrar_lotes_minimos(exchange: Any) -> List[str]:
-    """
-    Audita los mercados de Bybit al arrancar y excluye en ESTADO_RAM cualquier
-    par cuyo lote minimo supere el nocional maximo permitido para su clase.
-    En produccion excluye preventivamente TAO/USDT:USDT e INJ/USDT:USDT (SCAR-LOCK-05).
-    """
     excluidos: List[str] = []
     if not cfg.es_modo_test():
         ESTADO_RAM.pares_excluidos_lote.add("TAO/USDT:USDT")
@@ -320,6 +319,7 @@ class MotorOmegaPhantomV7:
         self.cerrojo: CerrojoInstanciaUnica = CerrojoInstanciaUnica()
         self.exchange: Optional[Any] = None
         self.detener_evento: asyncio.Event = asyncio.Event()
+        self.disparo_en_progreso: bool = False
         self.mapa_ws_to_ccxt: Dict[str, str] = {}
         self.libros_ws: Dict[str, _LibroLocalL2] = {}
         for sym in (cfg.SIMBOLO_CENTINELA_MACRO,) + tuple(cfg.PARES_CAMPEONES_ALFA):
@@ -342,6 +342,17 @@ class MotorOmegaPhantomV7:
         if cfg.MODO_PAPER:
             ex.set_sandbox_mode(True)
         return ex
+
+    async def _despachar_senal_con_cerrojo(self, senal: Dict[str, Any]) -> None:
+        if self.disparo_en_progreso:
+            return
+        self.disparo_en_progreso = True
+        try:
+            await EJECUTOR_SNIPER.ejecutar_senal_sniper(senal)
+        except Exception as exc:
+            log_sniper(f"[MAIN DISPARO WARN] {exc}")
+        finally:
+            self.disparo_en_progreso = False
 
     async def _procesar_evento_ws_bybit(self, payload: Dict[str, Any]) -> None:
         topic = str(payload.get("topic", ""))
@@ -380,6 +391,9 @@ class MotorOmegaPhantomV7:
             if not bids or not asks:
                 return
 
+            if self.disparo_en_progreso:
+                return
+
             mid = (float(bids[0][0]) + float(asks[0][0])) * 0.5
             senal = RADAR.procesar_libro_l2(
                 symbol=ccxt_sym,
@@ -393,14 +407,9 @@ class MotorOmegaPhantomV7:
                     f"Z={senal['z_score']:+.2f} | dp={senal['delta_p_pct']*100:+.2f}% | EMA900={senal['ema900_dist_pct']*100:+.2f}% | "
                     f"OFI={senal['ofi']:+.2f} | H={senal['hurst']:.3f} -> DISPARO APROBADO"
                 )
-                asyncio.create_task(EJECUTOR_SNIPER.ejecutar_senal_sniper(senal))
+                asyncio.create_task(self._despachar_senal_con_cerrojo(senal))
 
     async def _bucle_radar_ws_50hz(self) -> None:
-        """
-        Conexion WebSocket persistente a Bybit V5 Public Linear Stream:
-        Recibe actualizaciones L2 cada 20 ms (50 Hz) y trades Taker en vivo
-        con 0 llamadas REST.
-        """
         args_sub: List[str] = []
         for raw_sym in self.mapa_ws_to_ccxt:
             args_sub.append(f"orderbook.50.{raw_sym}")
@@ -449,19 +458,9 @@ class MotorOmegaPhantomV7:
                     )
 
                 ciclo += 1
-                if ciclo % 2 == 0 and self.exchange is not None and not ESTADO_RAM.posiciones_activas:
-                    try:
-                        bal = await self.exchange.fetch_balance()
-                        usdt_info = bal.get("USDT", {}) if isinstance(bal, dict) else {}
-                        tot = float(
-                            usdt_info.get("total", 0.0)
-                            or bal.get("total", {}).get("USDT", 0.0)
-                            or 0.0
-                        )
-                        if tot > 0.0:
-                            CAJA_NEGRA.sincronizar_paridad_uta(tot)
-                    except Exception:
-                        pass
+                if ciclo % 2 == 0 and self.exchange is not None and not self.disparo_en_progreso:
+                    if not ESTADO_RAM.posiciones_activas:
+                        await reconciliar_posiciones_arranque(self.exchange)
 
                 if ciclo % 2 == 0:
                     tk_z = ESTADO_RAM.ticks_ram.get("ZEREBRO/USDT:USDT")
