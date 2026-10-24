@@ -9,10 +9,8 @@ Motor de Disparo Zero-REST con:
   1. Precio de Reserva Dinamico de Avellaneda-Stoikov modificado por Hawkes.
   2. Consulta Bybit V5 `fetch_order(..., {"acknowledged": True})` blindada
      contra excepciones CCXT + verificacion de respaldo en `fetch_positions`.
-  3. Stop-Loss fisico en servidor Bybit V5 via `private_post_v5_position_trading_stop`
-     (MarkPrice, positionIdx=0).
-  4. Vigilancia de Cola de Moallemi-Yuan (TTL=3.80s en produccion / 2.20s en
-     test) con Re-Pegging pasivo unico a 1.80s (SCAR-LOCK-06).
+  3. Stop-Loss fisico en servidor Bybit V5 anclado al Bid/Ask actual para
+     evitar rechazos `retCode: 10001` por diferencia con `MarkPrice`.
 ==============================================================================
 """
 from __future__ import annotations
@@ -202,13 +200,21 @@ class EjecutorSniper:
         if self.exchange is None:
             return True
         raw_sym = symbol.split("/")[0] + "USDT"
+        tk = ESTADO_RAM.ticks_ram.get(symbol)
+        sl_seguro = float(sl_price)
+        if tk is not None and tk.bid > 0.0 and tk.ask > 0.0 and not cfg.es_modo_test():
+            if str(side_posicion).lower() == "long" and sl_seguro >= tk.bid:
+                sl_seguro = self.redondear_precio(symbol, tk.bid * (1.0 - cfg.SL_BYBIT_SERVIDOR_PCT))
+            elif str(side_posicion).lower() == "short" and sl_seguro <= tk.ask:
+                sl_seguro = self.redondear_precio(symbol, tk.ask * (1.0 + cfg.SL_BYBIT_SERVIDOR_PCT))
+
         try:
             if hasattr(self.exchange, "private_post_v5_position_trading_stop"):
                 await self.exchange.private_post_v5_position_trading_stop(
                     {
                         "category": "linear",
                         "symbol": raw_sym,
-                        "stopLoss": str(sl_price),
+                        "stopLoss": str(sl_seguro),
                         "slTriggerBy": "MarkPrice",
                         "positionIdx": 0,
                     }
@@ -217,7 +223,7 @@ class EjecutorSniper:
             if hasattr(self.exchange, "set_trading_stop"):
                 await self.exchange.set_trading_stop(
                     symbol=symbol,
-                    stopLoss=sl_price,
+                    stopLoss=sl_seguro,
                 )
                 return True
         except Exception as exc:
@@ -426,7 +432,6 @@ class EjecutorSniper:
                     except Exception:
                         pass
 
-                # Verificacion final de seguridad en Bybit UTA por si lleno justo al cancelar
                 q_pos, px_pos = await self._verificar_posicion_abierta_bybit(symbol, precio_quote)
                 if q_pos > 0.0:
                     qty_llenada = q_pos

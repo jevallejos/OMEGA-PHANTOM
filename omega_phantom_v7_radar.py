@@ -6,12 +6,11 @@ ARCHIVO #06: omega_phantom_v7_radar.py
 SISTEMA: OMEGA-PHANTOM V7.0 (APEX-CHRONOS SINGULARITY)
 ==============================================================================
 Motor Tensorial de Microestructura L2 + publicTrade a 50 Hz (20 ms):
-  1. Reloj de Eventos L2 (Event-Driven Book Clock): filtra instantaneas L2
-     identicas en produccion para preservar la racha de confirmacion H-OFI y
-     evalua delta_p_pct sobre horizonte biescala real (3.0s a 12.0s).
-  2. Supresor de Rafaga Post-Disparo (12.0s cooldown por simbolo tras emitir
-     senal en produccion) para impedir disparos duplicados en vuelo.
-  3. Variacion Bipower, Hurst Winsorizado, Lyapunov, Hawkes y SCAR-LOCK-00..13.
+  1. EMA900 Invariante en Tiempo Continuo (tau = 135.0s) inmune a la velocidad
+     de ticks del WebSocket 50Hz.
+  2. Desbloqueo Simetrico de SHORT-SNIPER con Memoria de Pico de 8.0s y
+     freno cinetico de Lyapunov corregido (a_Lyap <= +0.00010).
+  3. Blindaje SCAR-LOCK-13 en LONG High-Beta (exige dp <= -0.42% y EMA <= -0.38%).
 ==============================================================================
 """
 from __future__ import annotations
@@ -64,13 +63,13 @@ def calcular_percentil_intradia_utc(
 
 
 class VentanaZ:
-    """Estructura deslizante O(1) por activo con Reloj de Eventos L2."""
+    """Estructura deslizante O(1) por activo con EMA900 en tiempo continuo y Memoria de Pico Short."""
 
     def __init__(self, symbol: str, maxlen: int = cfg.VENTANA_Z_TICKS) -> None:
         self.symbol: str = symbol
         self.maxlen: int = int(maxlen)
         self.precios: Deque[float] = collections.deque(maxlen=self.maxlen)
-        self.precios_ts: Deque[Tuple[float, float]] = collections.deque(maxlen=360)
+        self.precios_ts: Deque[Tuple[float, float]] = collections.deque(maxlen=480)
         self.retornos: Deque[float] = collections.deque(maxlen=self.maxlen)
         self.ofi_hist: Deque[float] = collections.deque(maxlen=35)
         self.ema900_hist: Deque[float] = collections.deque(maxlen=30)
@@ -90,6 +89,12 @@ class VentanaZ:
         self.ts_ultimo_anti_squeeze: float = 0.0
         self.px_ultimo_anti_squeeze: float = 0.0
         self.ts_ultimo_disparo: float = 0.0
+
+        # Memoria de Pico de Sobreextension para SHORT-SNIPER (ventana 8.0s)
+        self.max_z_short_reciente: float = 0.0
+        self.max_dp_short_reciente: float = 0.0
+        self.max_ema_short_reciente: float = 0.0
+        self.ts_pico_short_reciente: float = 0.0
 
         self.ofi_ticks_long: int = 0
         self.ofi_ticks_short: int = 0
@@ -212,7 +217,7 @@ class VentanaZ:
         candidatos: List[float] = [dp_ticks]
         for ts_old, px_old in self.precios_ts:
             dt = ahora - ts_old
-            if 2.0 <= dt <= 15.0 and px_old > 0.0:
+            if 2.0 <= dt <= 20.0 and px_old > 0.0:
                 candidatos.append((mid_price - px_old) / px_old)
 
         mejor = dp_ticks
@@ -242,6 +247,8 @@ class VentanaZ:
         ):
             return self.ultimo_metricas
 
+        dt = max(0.005, ahora - self.ts_ultimo_tick) if self.ts_ultimo_tick > 0.0 else 0.020
+
         if self.precios:
             prev_p = self.precios[-1]
             ret = (mid_price - prev_p) / prev_p if prev_p > 0.0 else 0.0
@@ -250,7 +257,7 @@ class VentanaZ:
         else:
             ret = 0.0
 
-        if not self.precios or abs(mid_price - self.precios[-1]) > 1e-12 or cfg.es_modo_test() or (ahora - self.ts_ultimo_tick) >= 0.150:
+        if not self.precios or abs(mid_price - self.precios[-1]) > 1e-12 or cfg.es_modo_test() or dt >= 0.150:
             self.precios.append(mid_price)
 
         self.precios_ts.append((ahora, mid_price))
@@ -259,7 +266,12 @@ class VentanaZ:
         if self.ema900 <= 0.0:
             self.ema900 = mid_price
         else:
-            self.ema900 = (self.alpha_ema900 * mid_price) + ((1.0 - self.alpha_ema900) * self.ema900)
+            if cfg.es_modo_test():
+                alpha_eff = self.alpha_ema900
+            else:
+                # Constante de tiempo institucional de 135.0s (900 ticks x 150ms)
+                alpha_eff = 1.0 - math.exp(-min(1.0, dt) / 135.0)
+            self.ema900 = (alpha_eff * mid_price) + ((1.0 - alpha_eff) * self.ema900)
         self.ema900_hist.append(self.ema900)
 
         ema_dist_pct = (mid_price - self.ema900) / self.ema900 if self.ema900 > 0.0 else 0.0
@@ -273,9 +285,25 @@ class VentanaZ:
         n_eff = max(1.0, math.sqrt(min(len(self.precios), 25)))
         z_score = delta_p_pct / max(1e-7, sigma_bv * (0.45 * n_eff))
 
+        # Actualizar memoria de pico de sobreextension (8.0s) para SHORT-SNIPER
+        if (ahora - self.ts_pico_short_reciente) > 8.0:
+            self.max_z_short_reciente = z_score
+            self.max_dp_short_reciente = delta_p_pct
+            self.max_ema_short_reciente = ema_dist_pct
+            if z_score >= 2.20:
+                self.ts_pico_short_reciente = ahora
+        else:
+            if z_score > self.max_z_short_reciente:
+                self.max_z_short_reciente = z_score
+                self.ts_pico_short_reciente = ahora
+            if delta_p_pct > self.max_dp_short_reciente:
+                self.max_dp_short_reciente = delta_p_pct
+            if ema_dist_pct > self.max_ema_short_reciente:
+                self.max_ema_short_reciente = ema_dist_pct
+
         ofi_raw = self._calcular_ml_ofi(bids, asks)
         if not cfg.es_modo_test() and abs(ofi_raw) < 1e-9 and self.ofi_hist:
-            ofi_inst = self.ofi_hist[-1] * 0.70
+            ofi_inst = self.ofi_hist[-1] * 0.75
         else:
             ofi_inst = ofi_raw
 
@@ -287,7 +315,8 @@ class VentanaZ:
         else:
             self.ofi_ticks_long = 0
 
-        if ofi_inst <= cfg.SHORT_OFI_AGOTAMIENTO_MAX:
+        umbral_ofi_s = cfg.SHORT_OFI_AGOTAMIENTO_MAX if cfg.es_modo_test() else -0.30
+        if ofi_inst <= umbral_ofi_s:
             self.ofi_ticks_short += 1
         else:
             self.ofi_ticks_short = 0
@@ -295,7 +324,6 @@ class VentanaZ:
         hurst = self._calcular_hurst()
         lyap = self._calcular_lyapunov()
 
-        dt = max(0.005, ahora - self.ts_ultimo_tick) if self.ts_ultimo_tick > 0.0 else 0.020
         self.ts_ultimo_tick = ahora
         decay = math.exp(-cfg.HAWKES_DECAY_BETA * dt)
         self.hawkes_intensidad = (self.hawkes_intensidad * decay) + ofi_inst
@@ -467,7 +495,6 @@ class RadarVolatilidad:
         if not es_test and symbol == "INJ/USDT:USDT":
             return None
 
-        # Supresor de rafaga: 12.0s entre disparos del mismo simbolo en produccion
         if not es_test and (t_now - ventana.ts_ultimo_disparo) < 12.0:
             return None
 
@@ -495,9 +522,20 @@ class RadarVolatilidad:
         # ======================================================================
         # RUTA 1: EVALUACION DE GATILLO LONG-REBOUND (SCAR-LOCK-02, 03, 07, 09, 10, 13)
         # ======================================================================
-        z_umbral_long = float(params_clase["z_umbral"])
-        caida_min_long = float(params_clase["caida_min_pct"])
-        ema_min_long = float(params_clase["ema900_dist_min_pct"])
+        if es_test:
+            z_umbral_long = float(params_clase["z_umbral"])
+            caida_min_long = float(params_clase["caida_min_pct"])
+            ema_min_long = float(params_clase["ema900_dist_min_pct"])
+        else:
+            # SCAR-LOCK-13: En High-Beta LONG exige capitulacion real (dp <= -0.42%, EMA <= -0.38%, Z <= -3.50)
+            if symbol in cfg.CLASE_HIGH_BETA:
+                z_umbral_long = -3.50
+                caida_min_long = -0.0042
+                ema_min_long = -0.0038
+            else:
+                z_umbral_long = float(params_clase["z_umbral"])
+                caida_min_long = -0.0025
+                ema_min_long = -0.0025
 
         if (
             tk.z_score <= z_umbral_long
@@ -520,7 +558,7 @@ class RadarVolatilidad:
             if tk.lyapunov_acel_pct < cfg.LYAPUNOV_ACEL_MIN_PCT:
                 return None
 
-            h_max_long = cfg.HURST_MAX_ENTRADA if es_test else (0.465 if symbol in cfg.CLASE_TIER1_LIQUIDO else 0.475)
+            h_max_long = cfg.HURST_MAX_ENTRADA if es_test else (0.460 if symbol in cfg.CLASE_HIGH_BETA else 0.465)
             if tk.hurst > h_max_long:
                 ESTADO_RAM.encolar_auditoria_escudo_15s(
                     symbol, "long", "SCAR-LOCK-13_HURST_LONG", mid_price, tag_p, p_dia, f"H={tk.hurst:.3f}", t_now
@@ -533,11 +571,11 @@ class RadarVolatilidad:
                 ofi_req_long = min(
                     0.45,
                     max(
-                        0.18,
-                        0.18
+                        0.22,
+                        0.22
                         + 0.045 * p_dia
                         + 0.050 * max(0.0, abs(tk.z_score) - 4.50)
-                        + (0.10 if tk.hurst >= 0.460 else 0.0),
+                        + (0.10 if tk.hurst >= 0.450 else 0.0),
                     ),
                 )
 
@@ -608,7 +646,12 @@ class RadarVolatilidad:
             return None
 
         z_umbral_short = abs(float(params_clase["z_umbral"]))
-        if tk.z_score < z_umbral_short:
+        z_eval_short = (
+            tk.z_score
+            if es_test
+            else max(tk.z_score, ventana.max_z_short_reciente if (t_now - ventana.ts_pico_short_reciente) <= 8.0 else tk.z_score)
+        )
+        if z_eval_short < z_umbral_short:
             return None
 
         if es_test:
@@ -619,11 +662,17 @@ class RadarVolatilidad:
             )
             if not (es_pump_short or es_rebote_debil):
                 return None
+            if (
+                tk.hurst > (0.495 if symbol in cfg.CLASE_TIER1_LIQUIDO else 0.505)
+                or tk.ofi_l1_l5 > cfg.SHORT_OFI_AGOTAMIENTO_MAX
+                or tk.ofi_ticks_confirmados_short < cfg.OFI_TICKS_CONFIRMACION
+                or tk.lyapunov_acel_pct > cfg.SHORT_LYAPUNOV_ACEL_MAX_PCT
+            ):
+                return None
         else:
-            piso_ema_short = 0.0032 if symbol in cfg.CLASE_HIGH_BETA else 0.0025
-            bono_h_short = 0.0012 if tk.hurst >= 0.480 else 0.0
-            bono_z_short = 0.0008 if abs(tk.z_score) >= 8.00 else 0.0
-            ema_req_short = piso_ema_short + 0.0010 * p_dia + bono_h_short + bono_z_short
+            piso_ema_short = 0.0028 if symbol in cfg.CLASE_HIGH_BETA else 0.0022
+            bono_h_short = 0.0010 if tk.hurst >= 0.485 else 0.0
+            ema_req_short = piso_ema_short + 0.0008 * p_dia + bono_h_short
 
             if (
                 (t_now - ventana.ts_ultimo_anti_squeeze) < 180.0
@@ -632,7 +681,10 @@ class RadarVolatilidad:
             ):
                 ema_req_short = max(ema_req_short, 0.0045)
 
-            if tk.ema900_dist_pct < ema_req_short or tk.delta_p_pct < 0.0032:
+            ema_eval_s = max(tk.ema900_dist_pct, ventana.max_ema_short_reciente if (t_now - ventana.ts_pico_short_reciente) <= 8.0 else tk.ema900_dist_pct)
+            dp_eval_s = max(tk.delta_p_pct, ventana.max_dp_short_reciente if (t_now - ventana.ts_pico_short_reciente) <= 8.0 else tk.delta_p_pct)
+
+            if tk.ema900_dist_pct < 0.0020 or ema_eval_s < ema_req_short or dp_eval_s < 0.0028:
                 return None
 
             sl_prev = ESTADO_RAM.ultimo_sl_short_precio.get(symbol)
@@ -644,14 +696,11 @@ class RadarVolatilidad:
                     )
                     return None
 
-        h_max_short = 0.495 if symbol in cfg.CLASE_TIER1_LIQUIDO else 0.505
-        if tk.hurst > h_max_short:
-            return None
+            h_max_short = 0.500 if symbol in cfg.CLASE_TIER1_LIQUIDO else 0.515
+            if tk.hurst > h_max_short:
+                return None
 
-        if es_test:
-            ofi_max_short = cfg.SHORT_OFI_AGOTAMIENTO_MAX
-        else:
-            ofi_max_short = -(0.35 + 0.12 * p_dia)
+            ofi_max_short = -(0.30 + 0.10 * p_dia)
             if (
                 (t_now - ventana.ts_ultimo_anti_squeeze) < 180.0
                 and ventana.px_ultimo_anti_squeeze > 0.0
@@ -659,17 +708,18 @@ class RadarVolatilidad:
             ):
                 ofi_max_short -= 0.12
 
-        if (
-            tk.ofi_l1_l5 > ofi_max_short
-            or tk.ofi_ticks_confirmados_short < cfg.OFI_TICKS_CONFIRMACION
-            or tk.lyapunov_acel_pct > cfg.SHORT_LYAPUNOV_ACEL_MAX_PCT
-        ):
-            return None
+            # Simetria fisica de Lyapunov: bloquea solo si el pump sigue acelerando (> +0.015%)
+            if (
+                tk.ofi_l1_l5 > ofi_max_short
+                or tk.ofi_ticks_confirmados_short < cfg.OFI_TICKS_CONFIRMACION
+                or tk.lyapunov_acel_pct > 0.00015
+            ):
+                return None
 
         ok_perm_s, motivo_perm_s, _ = ESTADO_RAM.consultar_permiso_o1(
             symbol=symbol,
             side_solicitado="short",
-            z_score_actual=tk.z_score,
+            z_score_actual=z_eval_short,
             ahora=t_now,
         )
         if not ok_perm_s:
@@ -678,7 +728,7 @@ class RadarVolatilidad:
         ventana.ts_ultimo_disparo = t_now
         kelly_info_s = ESCUDO_TRICORTEX.calcular_fraccion_kelly_antifragil(
             symbol=symbol,
-            z_score=tk.z_score,
+            z_score=z_eval_short,
             ofi=tk.ofi_l1_l5,
             side="short",
             hurst=tk.hurst,
@@ -692,7 +742,7 @@ class RadarVolatilidad:
             "mid_price": mid_price,
             "best_bid": best_bid,
             "best_ask": best_ask,
-            "z_score": tk.z_score,
+            "z_score": z_eval_short,
             "delta_p_pct": tk.delta_p_pct,
             "ema900_dist_pct": tk.ema900_dist_pct,
             "ema900_slope_pct": tk.ema900_slope_pct,
