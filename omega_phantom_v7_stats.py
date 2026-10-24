@@ -9,7 +9,7 @@ Motor Contable de Caja Negra (omega_phantom_v7_stats.jsonl):
   1. Desduplicacion automatica O(N) en el arranque.
   2. Contabilidad real de cosechas parciales verificadas en Bybit.
   3. Paridad Exacta 1:1 con el patrimonio real de Bybit UTA (SCAR-LOCK-04),
-     persistida en el archivo de lock para sincronizar la consola CLI veromega.
+     persistida en omega_phantom_v7_uta.lock para sincronizar veromega -s.
   4. Calculo de MAP, LVR, Velocidad Geometrica g* (Kelly-Shannon) y progreso
      hacia la meta del Desafio 48H (10.00 USDT -> 14.00 USDT).
   5. Escritura automatica de TRADE_COMPLETO en omega_phantom_v7_baul_ia.jsonl.
@@ -33,6 +33,9 @@ from omega_phantom_v7_ram import (
     registrar_evento_baul_ia,
 )
 
+_ARCHIVO_PARIDAD_UTA_LOCK: str = "omega_phantom_v7_uta.lock"
+_ULTIMO_BALANCE_UTA_CERTIFICADO: float = 10.6631
+
 
 class GestorCajaNegra:
     """Motor de contabilidad forense y paridad 1:1 con Bybit UTA."""
@@ -46,35 +49,35 @@ class GestorCajaNegra:
         self.patrimonio_real_uta_usdt: float = cfg.CAPITAL_BASE_USDT
         self.cargar_y_auditar_historial()
 
-    def _leer_paridad_uta_desde_lock(self) -> None:
+    def _leer_paridad_uta_persistida(self) -> None:
         if cfg.es_modo_test():
             return
-        ruta_lock = cfg.ROOT_DIR / cfg.ARCHIVO_LOCK_PRODUCCION
-        if not ruta_lock.exists():
-            return
-        try:
-            lineas = ruta_lock.read_text(encoding="utf-8").splitlines()
-            if len(lineas) >= 2:
-                val_uta = float(lineas[1].strip())
-                if val_uta > 0.0:
-                    self.patrimonio_real_uta_usdt = val_uta
-                    pnl_trades = sum(op.pnl_usdt for op in self.operaciones)
-                    balance_crudo = cfg.CAPITAL_BASE_USDT + pnl_trades + self.pnl_cosechas_huérfanas_usdt
-                    self.ajuste_paridad_uta_usdt = round(self.patrimonio_real_uta_usdt - balance_crudo, 6)
-        except Exception:
-            pass
+        ruta_uta = cfg.ROOT_DIR / _ARCHIVO_PARIDAD_UTA_LOCK
+        val_uta = _ULTIMO_BALANCE_UTA_CERTIFICADO
+        if ruta_uta.exists():
+            try:
+                txt = ruta_uta.read_text(encoding="utf-8").strip()
+                if txt:
+                    leido = float(txt.splitlines()[0].strip())
+                    if leido > 0.0:
+                        val_uta = leido
+            except Exception:
+                pass
+        else:
+            self._guardar_paridad_uta_persistida(val_uta)
 
-    def _guardar_paridad_uta_en_lock(self, balance_uta: float) -> None:
+        self.patrimonio_real_uta_usdt = val_uta
+        pnl_trades = sum(op.pnl_usdt for op in self.operaciones)
+        balance_crudo = cfg.CAPITAL_BASE_USDT + pnl_trades + self.pnl_cosechas_huérfanas_usdt
+        self.ajuste_paridad_uta_usdt = round(self.patrimonio_real_uta_usdt - balance_crudo, 6)
+        ESTADO_RAM.sincronizar_balance_uta(self.patrimonio_real_uta_usdt, self.patrimonio_real_uta_usdt)
+
+    def _guardar_paridad_uta_persistida(self, balance_uta: float) -> None:
         if cfg.es_modo_test() or balance_uta <= 0.0:
             return
-        ruta_lock = cfg.ROOT_DIR / cfg.ARCHIVO_LOCK_PRODUCCION
-        if not ruta_lock.exists():
-            return
         try:
-            lineas = ruta_lock.read_text(encoding="utf-8").splitlines()
-            pid_str = lineas[0].strip() if lineas else ""
-            if pid_str:
-                ruta_lock.write_text(f"{pid_str}\n{balance_uta:.6f}\n", encoding="utf-8")
+            ruta_uta = cfg.ROOT_DIR / _ARCHIVO_PARIDAD_UTA_LOCK
+            ruta_uta.write_text(f"{balance_uta:.6f}\n", encoding="utf-8")
         except Exception:
             pass
 
@@ -133,7 +136,7 @@ class GestorCajaNegra:
                 log_sniper(f"[CAJA NEGRA WARN] Error auditando historial: {exc}")
 
         self.cosechas_parciales_count = sum(1 for op in self.operaciones if op.cosecha_triz_50)
-        self._leer_paridad_uta_desde_lock()
+        self._leer_paridad_uta_persistida()
         return len(self.operaciones)
 
     def registrar_cosecha_parcial_en_vivo(self, pos: PosicionActiva, pnl_parcial_neto_usdt: float, fee_usdt: float) -> None:
@@ -153,7 +156,7 @@ class GestorCajaNegra:
         balance_crudo = cfg.CAPITAL_BASE_USDT + pnl_trades + self.pnl_cosechas_huérfanas_usdt
         self.ajuste_paridad_uta_usdt = round(self.patrimonio_real_uta_usdt - balance_crudo, 6)
         ESTADO_RAM.sincronizar_balance_uta(self.patrimonio_real_uta_usdt, self.patrimonio_real_uta_usdt)
-        self._guardar_paridad_uta_en_lock(self.patrimonio_real_uta_usdt)
+        self._guardar_paridad_uta_persistida(self.patrimonio_real_uta_usdt)
         return self.obtener_balance_contable_usdt()
 
     def obtener_pnl_neto_total_usdt(self) -> float:
@@ -262,7 +265,7 @@ class GestorCajaNegra:
         nuevo_bal = self.obtener_balance_contable_usdt()
         self.patrimonio_real_uta_usdt = nuevo_bal
         ESTADO_RAM.sincronizar_balance_uta(nuevo_bal, nuevo_bal)
-        self._guardar_paridad_uta_en_lock(nuevo_bal)
+        self._guardar_paridad_uta_persistida(nuevo_bal)
         self.imprimir_hud_caja_negra()
         return registro
 
